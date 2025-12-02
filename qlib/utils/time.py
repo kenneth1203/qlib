@@ -12,7 +12,7 @@ import re
 import pandas as pd
 
 from qlib.config import C
-from qlib.constant import REG_CN, REG_TW, REG_US
+from qlib.constant import REG_CN, REG_TW, REG_US, REG_HK
 
 
 CN_TIME = [
@@ -25,6 +25,12 @@ US_TIME = [datetime.strptime("9:30", "%H:%M"), datetime.strptime("16:00", "%H:%M
 TW_TIME = [
     datetime.strptime("9:00", "%H:%M"),
     datetime.strptime("13:30", "%H:%M"),
+]
+HK_TIME = [
+    datetime.strptime("9:30", "%H:%M"),
+    datetime.strptime("12:00", "%H:%M"),
+    datetime.strptime("13:00", "%H:%M"),
+    datetime.strptime("16:00", "%H:%M"),
 ]
 
 
@@ -65,6 +71,13 @@ def get_min_cal(shift: int = 0, region: str = REG_CN) -> List[time]:
             pd.date_range(US_TIME[0], US_TIME[1] - timedelta(minutes=1), freq="1min") - pd.Timedelta(minutes=shift)
         ):
             cal.append(ts.time())
+    elif region == REG_HK:
+        for ts in list(
+            pd.date_range(HK_TIME[0], HK_TIME[1] - timedelta(minutes=1), freq="1min") - pd.Timedelta(minutes=shift)
+        ) + list(
+            pd.date_range(HK_TIME[2], HK_TIME[3] - timedelta(minutes=1), freq="1min") - pd.Timedelta(minutes=shift)
+        ):
+            cal.append(ts.time())
     else:
         raise ValueError(f"{region} is not supported")
     return cal
@@ -103,6 +116,14 @@ def is_single_value(start_time, end_time, freq, region: str = REG_CN):
         return False
     elif region == REG_US:
         if end_time - start_time < freq:
+            return True
+        if start_time.hour == 15 and start_time.minute == 59 and start_time.second == 0:
+            return True
+        return False
+    elif region == REG_HK:
+        if end_time - start_time < freq:
+            return True
+        if start_time.hour == 11 and start_time.minute == 59 and start_time.second == 0:
             return True
         if start_time.hour == 15 and start_time.minute == 59 and start_time.second == 0:
             return True
@@ -274,6 +295,13 @@ def time_to_day_index(time_obj: Union[str, datetime], region: str = REG_CN):
     elif region == REG_TW:
         if TW_TIME[0] <= time_obj < TW_TIME[1]:
             return int((time_obj - TW_TIME[0]).total_seconds() / 60)
+        else:
+            raise ValueError(f"{time_obj} is not the opening time of the {region} stock market")
+    elif region == REG_HK:
+        if HK_TIME[0] <= time_obj < HK_TIME[1]:
+            return int((time_obj - HK_TIME[0]).total_seconds() / 60)
+        elif HK_TIME[2] <= time_obj < HK_TIME[3]:
+            return int((time_obj - HK_TIME[2]).total_seconds() / 60) + 150
         else:
             raise ValueError(f"{time_obj} is not the opening time of the {region} stock market")
     else:

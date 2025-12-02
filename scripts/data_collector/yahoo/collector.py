@@ -35,6 +35,8 @@ from data_collector.utils import (
     deco_retry,
     get_calendar_list,
     get_hs_stock_symbols,
+    get_hk_stock_symbols,
+    yahoo_hk_symbol_candidates,
     get_us_stock_symbols,
     get_in_stock_symbols,
     get_br_stock_symbols,
@@ -288,6 +290,88 @@ class YahooCollectorUS1d(YahooCollectorUS):
 
 
 class YahooCollectorUS1min(YahooCollectorUS):
+    pass
+
+
+class YahooCollectorHK(YahooCollector, ABC):
+    def get_instrument_list(self):
+        logger.info("get HK stock symbols......")
+        symbols = get_hk_stock_symbols()
+        logger.info(f"get {len(symbols)} symbols.")
+        return symbols
+
+    def download_index_data(self):
+        # currently no index download for HK
+        pass
+
+    def normalize_symbol(self, symbol):
+        s = str(symbol).strip()
+        if "." in s:
+            parts = s.split(".")
+            if parts[-1].lower() == "hk":
+                core = parts[0]
+                if core.isdigit():
+                    core = core.zfill(5)
+                return f"{core}.HK"
+            return s
+        if s.isdigit():
+            return f"{s.zfill(5)}.HK"
+        return s
+
+    @staticmethod
+    def get_data_from_remote(symbol, interval, start, end, show_1min_logging: bool = False):
+        """Override to try Yahoo candidate symbols for HK (one-leading-zero removed).
+
+        Returns the first successful DataFrame (with an extra column
+        `used_symbol_for_yahoo` indicating which Yahoo symbol was used),
+        or None if all candidates failed.
+        """
+        error_msg = f"{symbol}-{interval}-{start}-{end}"
+
+        def _show_logging_func(_s, _resp):
+            if interval == YahooCollector.INTERVAL_1min and show_1min_logging:
+                logger.warning(f"{error_msg}:{_resp}")
+
+        # normalize interval for yahooquery
+        _interval = "1m" if interval in ["1m", "1min"] else interval
+
+        candidates = yahoo_hk_symbol_candidates(symbol)
+        print(candidates)
+        for cand in candidates:
+            try:
+                _resp = Ticker(cand, asynchronous=False).history(interval=_interval, start=start, end=end)
+                print (_resp.head())
+                if isinstance(_resp, pd.DataFrame):
+                    df = _resp.reset_index()
+                    df["used_symbol_for_yahoo"] = cand
+                    return df
+                elif isinstance(_resp, dict):
+                    _temp_data = _resp.get(cand, {})
+                    if isinstance(_temp_data, str) or (
+                        isinstance(_resp, dict) and _temp_data.get("indicators", {}).get("quote", None) is None
+                    ):
+                        _show_logging_func(cand, _resp)
+                        # try next candidate
+                        continue
+                    # If dict contains data but not DataFrame, we skip conversion here
+                    _show_logging_func(cand, _resp)
+                else:
+                    _show_logging_func(cand, _resp)
+            except Exception:
+                logger.warning(
+                    f"get data error: {cand}--{start}--{end}"
+                    + "Your data request fails. This may be caused by your firewall (e.g. GFW). Please switch your network if you want to access Yahoo! data"
+                )
+
+        # none succeeded
+        return None
+
+    @property
+    def _timezone(self):
+        return "Asia/Hong_Kong"
+
+
+class YahooCollectorHK1d(YahooCollectorHK):
     pass
 
 
@@ -640,6 +724,13 @@ class YahooNormalizeUS1min(YahooNormalizeUS, YahooNormalize1min):
 
     def symbol_to_yahoo(self, symbol):
         return fname_to_code(symbol)
+
+class YahooNormalizeHK:
+    def _get_calendar_list(self) -> Iterable[pd.Timestamp]:
+        return get_calendar_list("HK_ALL")
+
+class YahooNormalizeHK1d(YahooNormalizeHK, YahooNormalize1d):
+    pass
 
 
 class YahooNormalizeIN:

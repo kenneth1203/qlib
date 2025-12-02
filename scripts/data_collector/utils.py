@@ -37,6 +37,7 @@ CALENDAR_BENCH_URL_MAP = {
     "US_ALL": "^GSPC",
     "IN_ALL": "^NSEI",
     "BR_ALL": "^BVSP",
+    "HK_ALL": "^HSI",
 }
 
 _BENCH_CALENDAR_LIST = None
@@ -46,6 +47,7 @@ _US_SYMBOLS = None
 _IN_SYMBOLS = None
 _BR_SYMBOLS = None
 _EN_FUND_SYMBOLS = None
+_HK_SYMBOLS = None
 _CALENDAR_MAP = {}
 
 # NOTE: Until 2020-10-20 20:00:00
@@ -53,12 +55,12 @@ MINIMUM_SYMBOLS_NUM = 3900
 
 
 def get_calendar_list(bench_code="CSI300") -> List[pd.Timestamp]:
-    """get SH/SZ history calendar list
+    """get history calendar list (CN/US/IN/BR/HK)
 
     Parameters
     ----------
     bench_code: str
-        value from ["CSI300", "CSI500", "ALL", "US_ALL"]
+        value from ["CSI300", "CSI500", "ALL", "US_ALL", "IN_ALL", "BR_ALL", "HK_ALL"]
 
     Returns
     -------
@@ -73,7 +75,7 @@ def get_calendar_list(bench_code="CSI300") -> List[pd.Timestamp]:
 
     calendar = _CALENDAR_MAP.get(bench_code, None)
     if calendar is None:
-        if bench_code.startswith("US_") or bench_code.startswith("IN_") or bench_code.startswith("BR_"):
+        if bench_code.startswith("US_") or bench_code.startswith("IN_") or bench_code.startswith("BR_") or bench_code.startswith("HK_"):
             print(Ticker(CALENDAR_BENCH_URL_MAP[bench_code]))
             print(Ticker(CALENDAR_BENCH_URL_MAP[bench_code]).history(interval="1d", period="max"))
             df = Ticker(CALENDAR_BENCH_URL_MAP[bench_code]).history(interval="1d", period="max")
@@ -375,6 +377,159 @@ def get_us_stock_symbols(qlib_data_path: [str, Path] = None) -> list:
         _US_SYMBOLS = sorted(set(map(_format, filter(lambda x: len(x) < 8 and not x.endswith("WS"), _all_symbols))))
 
     return _US_SYMBOLS
+
+
+def get_hk_stock_symbols(qlib_data_path: [str, Path] = None) -> list:
+    """get HK stock symbols using Futu OpenQuoteContext
+
+    This function requires a running Futu quote server (OpenD)
+    and the `futu` Python package installed. It will query
+    basic stock info and return a list of symbols formatted as
+    '00700.HK', '06998.HK', etc.
+
+    Parameters
+    ----------
+    qlib_data_path: Optional path to qlib data dir to extend symbols from local files
+
+    Returns
+    -------
+    list[str]
+    """
+    global _HK_SYMBOLS  # pylint: disable=W0603
+
+    try:
+        # local import to avoid hard dependency at module import time
+        from futu import OpenQuoteContext, RET_OK, Market, SecurityType
+    except Exception as e:  # pragma: no cover - runtime environment dependent
+        raise ImportError(
+            "The `futu` package is required for get_hk_stock_symbols(). "
+            "Install it and make sure a Futu OpenD quote server is running (default host=127.0.0.1, port=11111)."
+        ) from e
+
+    if _HK_SYMBOLS is None:
+        qc = OpenQuoteContext(host="127.0.0.1", port=11111)
+        try:
+            ret, df = qc.get_stock_basicinfo(Market.HK, SecurityType.STOCK)
+            if ret != RET_OK:
+                raise RuntimeError(f"Futu get_stock_basicinfo failed: {df}")
+
+            # DataFrame may contain a 'code' column like 'HK.00700' or similar.
+            codes = []
+            if hasattr(df, "get") and df is not None:
+                if "code" in df.columns:
+                    codes = df["code"].astype(str).tolist()
+                elif "stock_code" in df.columns:
+                    codes = df["stock_code"].astype(str).tolist()
+                else:
+                    # fallback to index values
+                    try:
+                        codes = list(df.index.astype(str))
+                    except Exception:
+                        codes = []
+
+            symbols = []
+            for c in codes:
+                if not c:
+                    continue
+                # common futu code format: 'HK.00700'
+                if "." in c:
+                    prefix, core = c.split('.', 1)
+                    # normalize to '00700.HK'
+                    symbol = f"{core}.HK"
+                else:
+                    # if plain numeric or already with suffix, try to normalize
+                    if c.endswith(".HK") or c.endswith(".hk"):
+                        symbol = c.upper()
+                    else:
+                        symbol = f"{c}.HK"
+                symbols.append(symbol)
+
+            # extend with local instruments if provided
+            if qlib_data_path is not None:
+                for _index in ["hk50", "hangseng"]:
+                    p = Path(qlib_data_path).joinpath(f"instruments/{_index}.txt")
+                    if p.exists():
+                        try:
+                            ins_df = pd.read_csv(p, sep="\t", names=["symbol", "start_date", "end_date"])
+                            symbols += ins_df["symbol"].astype(str).tolist()
+                        except Exception:
+                            pass
+
+            # dedupe and cache
+            symbols = sorted(set(symbols))
+
+            symbol_cache_path = Path("~/.cache/hk_symbols_cache.pkl").expanduser().resolve()
+            symbol_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with symbol_cache_path.open("wb") as fp:
+                    pickle.dump(symbols, fp)
+            except Exception:
+                logger.warning("Failed to write HK symbol cache")
+
+            _HK_SYMBOLS = symbols
+        finally:
+            try:
+                qc.close()
+            except Exception:
+                pass
+
+    return _HK_SYMBOLS
+
+
+def yahoo_hk_symbol_candidates(symbol: str) -> list:
+    """Generate candidate symbols to query Yahoo for HK stocks.
+
+    Yahoo sometimes uses a variant of the canonical 5-digit, zero-padded
+    symbol returned by Futu (for example, Futu: '00700.HK' vs Yahoo: '0700.HK').
+    Per user requirement, we only try removing a single leading zero as the
+    alternate candidate. This function returns candidates in order of
+    preference: [canonical_5digit, one_zero_removed].
+
+    Parameters
+    ----------
+    symbol: str
+        Symbol in forms like '00700.HK', '700.HK', '0700.HK'.
+
+    Returns
+    -------
+    list[str]
+    """
+    """Return a single Yahoo candidate according to rule:
+
+    - If the numeric core (after canonical zero-padding to 5 digits) starts
+      with '0', remove exactly one leading zero and return that variant.
+    - Otherwise return the canonical 5-digit zero-padded symbol.
+
+    The return type is a list containing exactly one candidate string to
+    preserve the previous callers' expectation of a list.
+    """
+    if not symbol:
+        return []
+    s = str(symbol).strip()
+    if "." in s:
+        core, suffix = s.split(".", 1)
+        suffix = suffix.upper()
+    else:
+        core, suffix = s, "HK"
+
+    # canonical core zero-padded to 5 digits when numeric
+    if core.isdigit():
+        canonical_core = core.zfill(5)
+    else:
+        canonical_core = core
+
+    # If canonical starts with '0', remove exactly one leading zero and use that.
+    if canonical_core.startswith("0") and len(canonical_core) > 1:
+        candidate_core = canonical_core[1:]
+        # guard: if removal produces empty string, fall back to canonical
+        if not candidate_core:
+            candidate = f"{canonical_core}.{suffix}"
+        else:
+            candidate = f"{candidate_core}.{suffix}"
+    else:
+        candidate = f"{canonical_core}.{suffix}"
+
+    return [candidate]
 
 
 def get_in_stock_symbols(qlib_data_path: [str, Path] = None) -> list:
