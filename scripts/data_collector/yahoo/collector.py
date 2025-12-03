@@ -476,18 +476,49 @@ class YahooNormalize(BaseNormalize):
         columns = copy.deepcopy(YahooNormalize.COLUMNS)
         df = df.copy()
         df.set_index(date_field_name, inplace=True)
-        df.index = pd.to_datetime(df.index)
-        df.index = df.index.tz_localize(None)
+
+        # Robustly convert index to timezone-naive DatetimeIndex (handle mixed formats)
+        tmp_idx = []
+        for _v in df.index:
+            try:
+                ts = pd.Timestamp(_v)
+                # If tz-aware, drop tzinfo while preserving wall-clock time
+                if getattr(ts, "tz", None) is not None and ts.tz is not None:
+                    py_dt = ts.to_pydatetime().replace(tzinfo=None)
+                    tmp_idx.append(pd.Timestamp(py_dt))
+                else:
+                    tmp_idx.append(ts)
+            except Exception:
+                tmp_idx.append(pd.NaT)
+
+        df.index = pd.DatetimeIndex(tmp_idx)
+        # drop rows with unparseable index entries and log how many were removed
+        if df.index.isna().any():
+            n_drop = int(df.index.isna().sum())
+            logger.warning(f"{symbol}: dropped {n_drop} rows due to unparseable dates")
+            df = df[~df.index.isna()]
+        # remove duplicate timestamps (keep first)
         df = df[~df.index.duplicated(keep="first")]
         if calendar_list is not None:
-            df = df.reindex(
-                pd.DataFrame(index=calendar_list)
-                .loc[
-                    pd.Timestamp(df.index.min()).date() : pd.Timestamp(df.index.max()).date()
-                    + pd.Timedelta(hours=23, minutes=59)
-                ]
-                .index
-            )
+            # Build timezone-naive DatetimeIndex from calendar_list robustly.
+            tmp_list = []
+            for _d in list(calendar_list):
+                ts = pd.Timestamp(_d)
+                # If ts has tz info, drop tz while preserving wall-time
+                if getattr(ts, "tz", None) is not None and ts.tz is not None:
+                    py_dt = ts.to_pydatetime().replace(tzinfo=None)
+                    tmp_list.append(pd.Timestamp(py_dt))
+                else:
+                    tmp_list.append(ts)
+            cal_index = pd.DatetimeIndex(tmp_list)
+            cal_index = cal_index.sort_values().unique()
+            # determine start/end bounds as timezone-naive timestamps
+            start_ts = pd.Timestamp(df.index.min()).normalize()
+            end_ts = pd.Timestamp(df.index.max()).normalize() + pd.Timedelta(hours=23, minutes=59)
+            # filter calendar index within bounds
+            cal_index = cal_index[(cal_index >= start_ts) & (cal_index <= end_ts)]
+            # reindex by the filtered DatetimeIndex
+            df = df.reindex(cal_index)
         df.sort_index(inplace=True)
         df.loc[(df["volume"] <= 0) | np.isnan(df["volume"]), list(set(df.columns) - {symbol_field_name})] = np.nan
 
@@ -579,15 +610,29 @@ class YahooNormalize1d(YahooNormalize, ABC):
         df = df.copy()
         df.sort_values(self._date_field_name, inplace=True)
         df = df.set_index(self._date_field_name)
-        _close = self._get_first_close(df)
+    
+        # compute a numeric first close; if unavailable or zero, warn and skip adjustments
+        try:
+            _close = float(self._get_first_close(df))
+        except Exception:
+            logger.warning("Unable to determine first close for manual adjustment; skipping manual adjustment")
+            return df.reset_index()
+    
+        if _close == 0 or pd.isna(_close):
+            logger.warning("First close is zero or NaN; skipping manual adjustment to avoid division by zero")
+            return df.reset_index()
+    
+        # Convert numeric columns (except symbol/adjclose/change) to numeric safely, then apply adjustments
         for _col in df.columns:
-            # NOTE: retain original adjclose, required for incremental updates
             if _col in [self._symbol_field_name, "adjclose", "change"]:
                 continue
+            # coerce values to numeric; invalid parsing becomes NaN
+            df[_col] = pd.to_numeric(df[_col], errors="coerce")
             if _col == "volume":
                 df[_col] = df[_col] * _close
             else:
                 df[_col] = df[_col] / _close
+    
         return df.reset_index()
 
 
