@@ -3,7 +3,8 @@
 
 from collections import Counter
 
-import gym
+#import gym
+import gymnasium as gym
 import numpy as np
 from tianshou.data import Batch, Collector
 from tianshou.policy import BasePolicy

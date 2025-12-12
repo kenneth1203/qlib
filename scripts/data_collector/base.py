@@ -40,6 +40,7 @@ class BaseCollector(abc.ABC):
         delay=0,
         check_data_length: int = None,
         limit_nums: int = None,
+        symbols: [str, Iterable[str]] = None,
     ):
         """
 
@@ -74,10 +75,22 @@ class BaseCollector(abc.ABC):
         self.interval = interval
         self.check_data_length = max(int(check_data_length) if check_data_length is not None else 0, 0)
 
+        # optional explicit symbol list (string with commas or iterable)
+        self.symbols = None
+        if symbols is not None:
+            if isinstance(symbols, str):
+                self.symbols = [s.strip() for s in symbols.split(",") if s.strip()]
+            else:
+                self.symbols = list(symbols)
+
         self.start_datetime = self.normalize_start_datetime(start)
         self.end_datetime = self.normalize_end_datetime(end)
 
-        self.instrument_list = sorted(set(self.get_instrument_list()))
+        # if user provided symbols, use them directly; otherwise fetch from provider
+        if self.symbols:
+            self.instrument_list = sorted(set(self.symbols))
+        else:
+            self.instrument_list = sorted(set(self.get_instrument_list()))
 
         if limit_nums is not None:
             try:
@@ -163,10 +176,28 @@ class BaseCollector(abc.ABC):
             logger.warning(f"{symbol} is empty")
             return
 
-        symbol = self.normalize_symbol(symbol)
-        symbol = code_to_fname(symbol)
-        instrument_path = self.save_dir.joinpath(f"{symbol}.csv")
-        df["symbol"] = symbol
+        # Allow mapping of special tickers (indices) to a qlib instrument code.
+        # Example: '^HSI' -> '80000.HK'
+        special_symbol_map = {
+            "^HSI": "800000.HK",
+        }
+
+        # If the incoming symbol is a special ticker (e.g. '^HSI') and present in map,
+        # use the mapped instrument for saving only. Requests to remote data sources
+        # should still use the original symbol upstream.
+        mapped_symbol = special_symbol_map.get(symbol)
+        if mapped_symbol:
+            symbol_to_save = mapped_symbol
+        else:
+            symbol_to_save = symbol
+
+        # Normalize and convert to a filename-friendly code
+        symbol_to_fname = self.normalize_symbol(symbol_to_save)
+        symbol_to_fname = code_to_fname(symbol_to_fname)
+
+        instrument_path = self.save_dir.joinpath(f"{symbol_to_fname}.csv")
+        # write the symbol column as the normalized/saved instrument name
+        df["symbol"] = symbol_to_fname
         if instrument_path.exists():
             _old_df = pd.read_csv(instrument_path)
             df = pd.concat([_old_df, df], sort=False)

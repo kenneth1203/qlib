@@ -360,12 +360,14 @@ class MLflowRecorder(Recorder):
         return run
 
     def _log_uncommitted_code(self):
-        """
-        Mlflow only log the commit id of the current repo. But usually, user will have a lot of uncommitted changes.
-        So this tries to automatically to log them all.
-        """
-        # TODO: the sub-directories maybe git repos.
-        # So it will be better if we can walk the sub-directories and log the uncommitted changes.
+        # skip if not a git repo to avoid noisy warnings
+        try:
+            ok = subprocess.check_output("git rev-parse --is-inside-work-tree", shell=True, stderr=subprocess.DEVNULL)
+            if not ok:
+                return
+        except Exception:
+            return
+    
         for cmd, fname in [
             ("git diff", "code_diff.txt"),
             ("git status", "code_status.txt"),
@@ -373,7 +375,7 @@ class MLflowRecorder(Recorder):
         ]:
             try:
                 out = subprocess.check_output(cmd, shell=True)
-                self.client.log_text(self.id, out.decode(), fname)  # this behaves same as above
+                self.client.log_text(self.id, out.decode(), fname)
             except subprocess.CalledProcessError:
                 logger.info(f"Fail to log the uncommitted code of $CWD({os.getcwd()}) when run {cmd}.")
 

@@ -128,7 +128,22 @@ class TradeCalendarManager:
         if trade_step is None:
             trade_step = self.get_trade_step()
         calendar_index = self.start_index + trade_step - shift
-        return self._calendar[calendar_index], epsilon_change(self._calendar[calendar_index + 1])
+        # basic bounds check (fail early if something really wrong)
+        if calendar_index < 0:
+            raise IndexError(f"calendar_index {calendar_index} < 0")
+        # If calendar_index is beyond end, that's an error
+        if calendar_index >= len(self._calendar):
+            raise IndexError(f"calendar_index {calendar_index} >= {len(self._calendar)}")
+        
+        # Normal case: right endpoint = next_calendar - epsilon (i.e., next day minus 1s)
+        if calendar_index + 1 < len(self._calendar):
+            right = epsilon_change(self._calendar[calendar_index + 1])
+        else:
+            # Last calendar item: use current time + epsilon as a tiny forward endpoint
+            # (avoids indexing past array)
+            right = epsilon_change(self._calendar[calendar_index], direction="forward")
+        
+        return self._calendar[calendar_index], right
 
     def get_data_cal_range(self, rtype: str = "full") -> Tuple[int, int]:
         """

@@ -61,6 +61,7 @@ class YahooCollector(BaseCollector):
         delay=0,
         check_data_length: int = None,
         limit_nums: int = None,
+        symbols: [str, Iterable[str]] = None,
     ):
         """
 
@@ -95,6 +96,7 @@ class YahooCollector(BaseCollector):
             delay=delay,
             check_data_length=check_data_length,
             limit_nums=limit_nums,
+            symbols=symbols,
         )
 
         self.init_datetime()
@@ -566,6 +568,27 @@ class YahooNormalize(BaseNormalize):
 
 class YahooNormalize1d(YahooNormalize, ABC):
     DAILY_FORMAT = "%Y-%m-%d"
+    def __init__(
+        self,
+        date_field_name: str = "date",
+        symbol_field_name: str = "symbol",
+        skip_manual_adjust: bool = False,
+        **kwargs,
+    ):
+        """
+
+        Parameters
+        ----------
+        date_field_name: str
+            date field name, default is date
+        symbol_field_name: str
+            symbol field name, default is symbol
+        skip_manual_adjust: bool
+            If True, skip the manual adjustment step that rescales prices
+            so the first valid close equals 1. Default False.
+        """
+        super(YahooNormalize1d, self).__init__(date_field_name=date_field_name, symbol_field_name=symbol_field_name, **kwargs)
+        self.skip_manual_adjust = bool(skip_manual_adjust)
 
     def adjusted_price(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
@@ -610,6 +633,10 @@ class YahooNormalize1d(YahooNormalize, ABC):
         df = df.copy()
         df.sort_values(self._date_field_name, inplace=True)
         df = df.set_index(self._date_field_name)
+
+        # If skip_manual_adjust is set, return early without scaling
+        if getattr(self, "skip_manual_adjust", False):
+            return df.reset_index()
     
         # compute a numeric first close; if unavailable or zero, warn and skip adjustments
         try:
@@ -896,6 +923,7 @@ class Run(BaseRun):
         end=None,
         check_data_length=None,
         limit_nums=None,
+        symbols: str = None,
     ):
         """download data from Internet
 
@@ -931,7 +959,7 @@ class Run(BaseRun):
         if self.interval == "1d" and pd.Timestamp(end) > pd.Timestamp(datetime.datetime.now().strftime("%Y-%m-%d")):
             raise ValueError(f"end_date: {end} is greater than the current date.")
 
-        super(Run, self).download_data(max_collector_count, delay, start, end, check_data_length, limit_nums)
+        super(Run, self).download_data(max_collector_count, delay, start, end, check_data_length, limit_nums, symbols=symbols)
 
     def normalize_data(
         self,
@@ -939,6 +967,7 @@ class Run(BaseRun):
         symbol_field_name: str = "symbol",
         end_date: str = None,
         qlib_data_1d_dir: str = None,
+        skip_manual_adjust: bool = False,
     ):
         """normalize data
 
@@ -970,7 +999,11 @@ class Run(BaseRun):
                     "If normalize 1min, the qlib_data_1d_dir parameter must be set: --qlib_data_1d_dir <user qlib 1d data >, Reference: https://github.com/microsoft/qlib/tree/main/scripts/data_collector/yahoo#automatic-update-of-daily-frequency-datafrom-yahoo-finance"
                 )
         super(Run, self).normalize_data(
-            date_field_name, symbol_field_name, end_date=end_date, qlib_data_1d_dir=qlib_data_1d_dir
+            date_field_name,
+            symbol_field_name,
+            end_date=end_date,
+            qlib_data_1d_dir=qlib_data_1d_dir,
+            skip_manual_adjust=skip_manual_adjust,
         )
 
     def normalize_data_1d_extend(

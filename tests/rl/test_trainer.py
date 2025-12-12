@@ -7,7 +7,8 @@ import pytest
 
 import torch
 import torch.nn as nn
-from gym import spaces
+#from gym import Space
+from gymnasium.spaces import Space
 from tianshou.policy import PPOPolicy
 
 from qlib.config import C

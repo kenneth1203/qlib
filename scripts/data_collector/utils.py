@@ -479,57 +479,57 @@ def get_hk_stock_symbols(qlib_data_path: [str, Path] = None) -> list:
 def yahoo_hk_symbol_candidates(symbol: str) -> list:
     """Generate candidate symbols to query Yahoo for HK stocks.
 
-    Yahoo sometimes uses a variant of the canonical 5-digit, zero-padded
-    symbol returned by Futu (for example, Futu: '00700.HK' vs Yahoo: '0700.HK').
-    Per user requirement, we only try removing a single leading zero as the
-    alternate candidate. This function returns candidates in order of
-    preference: [canonical_5digit, one_zero_removed].
-
-    Parameters
-    ----------
-    symbol: str
-        Symbol in forms like '00700.HK', '700.HK', '0700.HK'.
-
-    Returns
-    -------
-    list[str]
-    """
-    """Return a single Yahoo candidate according to rule:
-
-    - If the numeric core (after canonical zero-padding to 5 digits) starts
-      with '0', remove exactly one leading zero and return that variant.
-    - Otherwise return the canonical 5-digit zero-padded symbol.
-
-    The return type is a list containing exactly one candidate string to
-    preserve the previous callers' expectation of a list.
+    Rules:
+    - If the symbol is an index/special ticker (starts with '^'), return it unchanged.
+    - If the symbol contains non-digit core (e.g., 'HSI' or other strings), return it unchanged.
+    - If the core is numeric, return a single candidate:
+        * canonical 5-digit zero-padded core with suffix (e.g., '00700.HK'), but
+        * if canonical begins with '0', return the variant with exactly one leading zero removed
+          (per user requirement).
     """
     if not symbol:
         return []
+
     s = str(symbol).strip()
+
+    # Preserve index/special tickers (e.g. ^HSI, ^GSPC)
+    if s.startswith("^"):
+        return [s]
+
+    # If symbol contains a dot (has explicit suffix), split and analyze core
     if "." in s:
         core, suffix = s.split(".", 1)
         suffix = suffix.upper()
-    else:
-        core, suffix = s, "HK"
-
-    # canonical core zero-padded to 5 digits when numeric
-    if core.isdigit():
-        canonical_core = core.zfill(5)
-    else:
-        canonical_core = core
-
-    # If canonical starts with '0', remove exactly one leading zero and use that.
-    if canonical_core.startswith("0") and len(canonical_core) > 1:
-        candidate_core = canonical_core[1:]
-        # guard: if removal produces empty string, fall back to canonical
-        if not candidate_core:
-            candidate = f"{canonical_core}.{suffix}"
+        # If core is numeric -> canonicalize; otherwise treat as non-numeric special symbol and return as-is
+        if core.isdigit():
+            canonical_core = core.zfill(5)
+            if canonical_core.startswith("0") and len(canonical_core) > 1:
+                candidate_core = canonical_core[1:]
+                if not candidate_core:
+                    candidate = f"{canonical_core}.{suffix}"
+                else:
+                    candidate = f"{candidate_core}.{suffix}"
+            else:
+                candidate = f"{canonical_core}.{suffix}"
+            return [candidate]
         else:
-            candidate = f"{candidate_core}.{suffix}"
-    else:
-        candidate = f"{canonical_core}.{suffix}"
+            # Non-numeric core with suffix (e.g., '^HSI' won't hit here since it starts with '^'),
+            # but this preserves other non-numeric suffixed symbols.
+            return [s]
 
-    return [candidate]
+    # No dot / no explicit suffix
+    if s.isdigit():
+        canonical_core = s.zfill(5)
+        if canonical_core.startswith("0") and len(canonical_core) > 1:
+            candidate_core = canonical_core[1:]
+            if not candidate_core:
+                return [f"{canonical_core}.HK"]
+            return [f"{candidate_core}.HK"]
+        else:
+            return [f"{canonical_core}.HK"]
+
+    # Non-digit, no dot: treat as special symbol (e.g., 'HSI') and keep as-is.
+    return [s]
 
 
 def get_in_stock_symbols(qlib_data_path: [str, Path] = None) -> list:

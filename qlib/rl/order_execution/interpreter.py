@@ -8,7 +8,8 @@ from typing import Any, List, Optional, cast
 
 import numpy as np
 import pandas as pd
-from gym import spaces
+#from gym import Space
+from gymnasium.spaces import Space
 
 from qlib.constant import EPS
 from qlib.rl.data.base import ProcessedDataProvider

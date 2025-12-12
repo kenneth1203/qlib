@@ -13,7 +13,8 @@ import warnings
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple, Type, Union, cast
 
-import gym
+#import gym
+import gymnasium as gym
 import numpy as np
 from tianshou.env import BaseVectorEnv, DummyVectorEnv, ShmemVectorEnv, SubprocVectorEnv
 
