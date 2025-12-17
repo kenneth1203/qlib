@@ -37,7 +37,8 @@ CALENDAR_BENCH_URL_MAP = {
     "US_ALL": "^GSPC",
     "IN_ALL": "^NSEI",
     "BR_ALL": "^BVSP",
-    "HK_ALL": "^HSI",
+    "HK_ALL": "0001.HK",
+    #"HK_ALL": "^HSI",
 }
 
 _BENCH_CALENDAR_LIST = None
@@ -108,6 +109,7 @@ def get_calendar_list(bench_code="CSI300") -> List[pd.Timestamp]:
                 calendar = _get_calendar(CALENDAR_BENCH_URL_MAP[bench_code])
         _CALENDAR_MAP[bench_code] = calendar
     logger.info(f"end of get calendar list: {bench_code}.")
+    calendar = [pd.Timestamp(x).strftime("%Y-%m-%d") for x in calendar]
     return calendar
 
 

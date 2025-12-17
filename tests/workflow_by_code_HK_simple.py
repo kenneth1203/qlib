@@ -43,7 +43,7 @@ HK_GBDT_TASK = {
                     "start_time": "2015-01-01",
                     "end_time": "2025-12-03",
                     "fit_start_time": "2015-01-01",
-                    "fit_end_time": "2023-12-31",
+                    "fit_end_time": "2022-12-31",
                     "instruments": "all",  # 若要限定標的可改成 ["800000.HK"] 或自訂清單
                 },
             },

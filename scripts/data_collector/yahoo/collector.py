@@ -48,7 +48,7 @@ INDEX_BENCH_URL = "http://push2his.eastmoney.com/api/qt/stock/kline/get?secid=1.
 
 
 class YahooCollector(BaseCollector):
-    retry = 5  # Configuration attribute.  How many times will it try to re-request the data if the network fails.
+    retry = 1  # Configuration attribute.  How many times will it try to re-request the data if the network fails.
 
     def __init__(
         self,
@@ -345,7 +345,9 @@ class YahooCollectorHK(YahooCollector, ABC):
                 print (_resp.head())
                 if isinstance(_resp, pd.DataFrame):
                     df = _resp.reset_index()
-                    df["used_symbol_for_yahoo"] = cand
+                    #df["used_symbol_for_yahoo"] = cand
+                    if interval.lower() == "1d" and "date" in df.columns:
+                        df["date"] = df["date"].astype(str).str[:10]
                     return df
                 elif isinstance(_resp, dict):
                     _temp_data = _resp.get(cand, {})
@@ -956,8 +958,8 @@ class Run(BaseRun):
             # get 1m data
             $ python collector.py download_data --source_dir ~/.qlib/stock_data/source --region CN --start 2020-11-01 --end 2020-11-10 --delay 0.1 --interval 1m
         """
-        if self.interval == "1d" and pd.Timestamp(end) > pd.Timestamp(datetime.datetime.now().strftime("%Y-%m-%d")):
-            raise ValueError(f"end_date: {end} is greater than the current date.")
+        #if self.interval == "1d" and pd.Timestamp(end) > pd.Timestamp(datetime.datetime.now().strftime("%Y-%m-%d")):
+            #raise ValueError(f"end_date: {end} is greater than the current date.")
 
         super(Run, self).download_data(max_collector_count, delay, start, end, check_data_length, limit_nums, symbols=symbols)
 
@@ -1105,7 +1107,7 @@ class Run(BaseRun):
         end_date: str = None,
         check_data_length: int = None,
         delay: float = 1,
-        exists_skip: bool = False,
+        exists_skip: bool = True,
     ):
         """update yahoo data to bin
 
@@ -1143,11 +1145,11 @@ class Run(BaseRun):
 
         # start/end date
         calendar_df = pd.read_csv(Path(qlib_data_1d_dir).joinpath("calendars/day.txt"))
-        trading_date = (pd.Timestamp(calendar_df.iloc[-1, 0]) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-
+        trading_date = (pd.Timestamp(calendar_df.iloc[-1, 0]) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        print(f"trading_date: {trading_date}")
         if end_date is None:
             end_date = (pd.Timestamp(trading_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-
+        print(f"end_date: {end_date}")
         # download data from yahoo
         # NOTE: when downloading data from YahooFinance, max_workers is recommended to be 1
         self.download_data(delay=delay, start=trading_date, end=end_date, check_data_length=check_data_length)
