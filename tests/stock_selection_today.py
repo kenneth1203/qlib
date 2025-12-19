@@ -12,11 +12,34 @@ import copy
 import datetime
 import os
 import pickle
-
 import qlib
 from qlib.workflow import R
 from qlib.utils import init_instance_by_config
 from qlib.constant import REG_HK
+from wcwidth import wcswidth
+
+
+def _disp_width(x):
+    try:
+        return wcswidth(str(x)) if x is not None else 0
+    except Exception:
+        return len(str(x)) if x is not None else 0
+
+
+def _pad_right(s, width):
+    s = "" if s is None else str(s)
+    cur = _disp_width(s)
+    if cur >= width:
+        return s
+    return s + " " * (width - cur)
+
+
+def _pad_left(s, width):
+    s = "" if s is None else str(s)
+    cur = _disp_width(s)
+    if cur >= width:
+        return s
+    return " " * (width - cur) + s
 
 
 def main(recorder_id, experiment_name, provider_uri, topk):
@@ -70,9 +93,14 @@ def main(recorder_id, experiment_name, provider_uri, topk):
     # Apply the same liquidity filter used in backtest to keep universes aligned
     try:
         hkw = ds_cfg["kwargs"]["handler"]["kwargs"]
+        # Ensure handler end_time is the latest available trading day from qlib calendar
+        try:
+            hkw["end_time"] = target_day
+        except Exception:
+            pass
         liq_window = 20
         keep_insts, info = hkmod.compute_liquid_instruments(
-            liq_threshold=1_000_000,
+            liq_threshold=3_000_000,
             liq_window=liq_window,
             handler_end_time=hkw.get("end_time", None),
         )
@@ -245,13 +273,40 @@ def main(recorder_id, experiment_name, provider_uri, topk):
             except Exception:
                 vol_map = {}
 
-            print("\nTop instruments (id, name, score, avg_dollar_volume):")
+            # Build a tidy view and print as an aligned table
+            rows = []
             for inst in selected:
                 score = float(score_df.loc[inst, "score"]) if inst in score_df.index else 0.0
                 mk = inst.split(".", 1)[0].zfill(5) + ".hk"
                 name = mapping.get(mk, "")
                 avg_dollar = int(round(vol_map.get(inst, 0)))
-                print(f"{mk}\t{name}\t{score:.6f}\t{avg_dollar:,}")
+                rows.append({"id": mk, "name": name, "score": score, "avg_dollar": avg_dollar})
+
+            view_df = pd.DataFrame(rows)
+            if not view_df.empty:
+                # prepare formatted string columns for aligned printing
+                view_df["_score_s"] = view_df["score"].map(lambda x: f"{x:.6f}")
+                view_df["_avg_s"] = view_df["avg_dollar"].map(lambda x: f"{int(x):,}")
+                # determine column widths (display width-aware)
+                cols = ["id", "name", "_score_s", "_avg_s"]
+                widths = {}
+                for c in cols:
+                    header_name = "score" if c == "_score_s" else ("avg_dollar" if c == "_avg_s" else c)
+                    max_cell = 0
+                    if not view_df.empty:
+                        max_cell = int(view_df[c].map(lambda v: _disp_width(v)).max())
+                    widths[c] = max(_disp_width(header_name), max_cell)
+                # header (use display-aware padding)
+                hdr = f"{_pad_right('id', widths['id'])}  {_pad_right('name', widths['name'])}  {_pad_left('score', widths['_score_s'])}  {_pad_left('avg_dollar', widths['_avg_s'])}"
+                print(f"\nTop {topk} instruments for {target_day}:")
+                print(hdr)
+                # rows (display-aware padding)
+                for _, r in view_df.iterrows():
+                    id_s = r['id'] if pd.notna(r['id']) else ''
+                    name_s = r['name'] if pd.notna(r['name']) else ''
+                    score_s = r['_score_s'] if pd.notna(r['_score_s']) else ''
+                    avg_s = r['_avg_s'] if pd.notna(r['_avg_s']) else ''
+                    print(f"{_pad_right(id_s, widths['id'])}  {_pad_right(name_s, widths['name'])}  {_pad_left(score_s, widths['_score_s'])}  {_pad_left(avg_s, widths['_avg_s'])}")
     except Exception:
         print("Prediction result:", pred)
 
@@ -261,13 +316,34 @@ def main(recorder_id, experiment_name, provider_uri, topk):
         pickle.dump(pred, f)
     print(f"Saved prediction to {out_path}")
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--recorder_id",default="84171777c98d42dbabe60bd7369198b6", help="recorder/run id (run id)")
+    parser.add_argument("--recorder_id", default=None, help="recorder/run id (run id). If omitted, use latest run folder under ./mlruns")
     parser.add_argument("--experiment_name", default="workflow", help="experiment name")
     parser.add_argument("--provider_uri", default="~/.qlib/qlib_data/hk_data", help="qlib data dir")
-    parser.add_argument("--topk", type=int, default=20, help="print top-k instruments")
+    parser.add_argument("--topk", type=int, default=50, help="print top-k instruments")
     args = parser.parse_args()
+    # If recorder_id not provided, pick latest run folder under ./mlruns
+    if args.recorder_id is None:
+        mlruns_dir = os.path.join(".", "mlruns")
+        if os.path.isdir(mlruns_dir):
+            runs = []
+            try:
+                for exp in os.listdir(mlruns_dir):
+                    exp_path = os.path.join(mlruns_dir, exp)
+                    if not os.path.isdir(exp_path):
+                        continue
+                    for run in os.listdir(exp_path):
+                        run_path = os.path.join(exp_path, run)
+                        if os.path.isdir(run_path):
+                            runs.append(run_path)
+            except Exception:
+                runs = []
+            if runs:
+                latest = max(runs, key=lambda p: os.path.getmtime(p))
+                args.recorder_id = os.path.basename(os.path.normpath(latest))
+                print(f"Auto-detected recorder_id from mlruns: {args.recorder_id}")
+        if args.recorder_id is None:
+            print("No recorder_id provided and no runs found in ./mlruns. Please supply --recorder_id")
+            raise SystemExit(1)
     main(args.recorder_id, args.experiment_name, args.provider_uri, args.topk)
-    

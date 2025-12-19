@@ -44,7 +44,7 @@ HK_GBDT_TASK = {
                 "module_path": "qlib.contrib.data.handler",
                 "kwargs": {
                     "start_time": "2005-01-01",        # ✅ 你的資料起點
-                    "end_time":   "2025-12-15",        # ✅ 你的資料終點
+                    "end_time":   "2025-12-17",        # ✅ 你的資料終點
                     "fit_start_time": "2005-01-01",    # ✅ normalize 用的資料
                     "fit_end_time":   "2021-12-31",    # ✅ 避免洩漏 test 資料
                     "instruments": "all",  # 若要限定標的可改成 ["800000.HK"] 或自訂清單
@@ -53,7 +53,7 @@ HK_GBDT_TASK = {
             "segments": {
                 "train": ("2005-01-01", "2019-12-31"),   # ✅ 15 年訓練
                 "valid": ("2020-01-01", "2021-12-31"),   # ✅ 2 年驗證
-                "test":  ("2022-01-01", "2025-12-15")    # ✅ 4 年測試
+                "test":  ("2022-01-01", "2025-12-17")    # ✅ 4 年測試
             },
         },
     },
@@ -117,6 +117,28 @@ if __name__ == "__main__":
     GetData().qlib_data(target_dir=provider_uri, region=REG_HK, exists_skip=True)
     qlib.init(provider_uri=provider_uri, region=REG_HK)
 
+    # Determine last trading day from qlib calendar and update task/backtest dates
+    try:
+        # Try explicit call; some qlib versions accept None arguments
+        cal = D.calendar(start_time=None, end_time=None, freq="day")
+        last_day = pd.to_datetime(cal[-1]).strftime("%Y-%m-%d") if len(cal) > 0 else pd.Timestamp.today().strftime("%Y-%m-%d")
+    except Exception:
+        try:
+            cal = D.calendar(freq="day")
+            last_day = pd.to_datetime(cal[-1]).strftime("%Y-%m-%d") if len(cal) > 0 else pd.Timestamp.today().strftime("%Y-%m-%d")
+        except Exception:
+            last_day = pd.Timestamp.today().strftime("%Y-%m-%d")
+    print("Last trading day determined from qlib calendar:", last_day)
+    # Update handler end_time and test segment end to last trading day (do NOT change fit_end_time)
+    HK_GBDT_TASK["dataset"]["kwargs"]["handler"]["kwargs"]["end_time"] = last_day
+    HK_GBDT_TASK["dataset"]["kwargs"]["segments"]["test"] = (
+        HK_GBDT_TASK["dataset"]["kwargs"]["segments"]["test"][0],
+        last_day,
+    )
+
+    # keep a module-scoped name for later use (extra_quote / backtest override)
+    _last_trading_day = last_day
+
     # --- Liquidity filter: reuse helper for consistent universe ---
     handler_kwargs = HK_GBDT_TASK["dataset"]["kwargs"]["handler"]["kwargs"]
     keep_insts, info = compute_liquid_instruments(
@@ -152,7 +174,7 @@ if __name__ == "__main__":
         factor_map = (qlib.config.C.trade_unit / bl).rename("$factor")
 
         # Build extra_quote with $close, $volume, and $factor for backtest date range
-        start, end = "2022-01-01", "2025-12-15"
+        start, end = "2022-01-01", _last_trading_day
         base = D.features(
             factor_map.index.tolist(),
             ["$close", "$volume"],
@@ -167,9 +189,9 @@ if __name__ == "__main__":
         extra_quote = extra_quote[["$close", "$volume", "$factor"]]
         # Add volume expression column required by exchange volume_threshold
         # Keep expression name in sync with exchange_kwargs below
-        vol_expr = "0.1 * $volume"
+        vol_expr = "0.2 * $volume"
         if vol_expr not in extra_quote.columns:
-            extra_quote[vol_expr] = extra_quote["$volume"] * 0.1
+            extra_quote[vol_expr] = extra_quote["$volume"] * 0.2
     else:
         extra_quote = None
 
@@ -187,7 +209,7 @@ if __name__ == "__main__":
             "module_path": "qlib.contrib.strategy.signal_strategy",
             "kwargs": {
                 "signal": (model, dataset),
-                "topk": 10,
+                "topk": 8,
                 "n_drop": 2,
                 "only_tradable": True,
                 "forbid_all_trade_at_limit": True
@@ -195,7 +217,7 @@ if __name__ == "__main__":
         },
         "backtest": {
             "start_time": "2022-01-01",   # ✅ 與 test 對齊
-            "end_time":   "2025-12-15",
+            "end_time":   "2025-12-17",   # ✅ 與 test 對齊
             "account": 1000000,
             "benchmark": HK_BENCH,
             "exchange_kwargs": {
@@ -206,7 +228,7 @@ if __name__ == "__main__":
                 "min_cost": 5,
                 "volume_threshold": {
                     # limit per-step traded volume to 10% of daily volume
-                    "all": ("current", "0.1 * $volume")
+                    "all": ("current", "0.2 * $volume")
                 },
                 # Inject per-instrument board-lot via factor if available
                 "extra_quote": extra_quote,
@@ -215,7 +237,13 @@ if __name__ == "__main__":
         },
     }
 
-    # NOTE: This line is optional
+    # If we computed a calendar last trading day, override backtest end_time for consistency
+    try:
+        port_analysis_config["backtest"]["end_time"] = _last_trading_day
+    except NameError:
+        pass
+
+        # NOTE: This line is optional
     # It demonstrates that the dataset can be used standalone.
     example_df = dataset.prepare("train")
     print(example_df.head())

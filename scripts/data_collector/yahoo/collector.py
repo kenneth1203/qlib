@@ -303,8 +303,35 @@ class YahooCollectorHK(YahooCollector, ABC):
         return symbols
 
     def download_index_data(self):
-        # currently no index download for HK
-        pass
+        # Download HSI (^HSI) and save as 800000.HK.csv so normalize/dump can treat it as benchmark
+        try:
+            logger.info("get HSI (^HSI) data......")
+            _start = self.start_datetime.strftime("%Y-%m-%d")
+            _end = self.end_datetime.strftime("%Y-%m-%d")
+            resp = Ticker("^HSI", asynchronous=False).history(interval="1d", start=_start, end=_end)
+            if isinstance(resp, pd.DataFrame) and not resp.empty:
+                df = resp.reset_index()
+                # Normalize date column to YYYY-MM-DD if present
+                if "date" in df.columns:
+                    df["date"] = df["date"].astype(str).str[:10]
+                # Ensure adjclose exists for later adjustment logic
+                if "adjclose" not in df.columns:
+                    if "close" in df.columns:
+                        df["adjclose"] = df["close"]
+                df["symbol"] = "800000.HK"
+                _path = self.save_dir.joinpath("800000.HK.csv")
+                try:
+                    if _path.exists():
+                        _old_df = pd.read_csv(_path)
+                        df = pd.concat([_old_df, df], sort=False)
+                except Exception:
+                    logger.warning(f"Failed to read existing HSI CSV at {_path}; will overwrite")
+                df.to_csv(_path, index=False)
+                logger.info(f"Saved HSI to {_path}")
+            else:
+                logger.warning("No HSI data fetched from Yahoo for given date range")
+        except Exception as e:
+            logger.warning(f"Failed to fetch HSI (^HSI): {e}")
 
     def normalize_symbol(self, symbol):
         s = str(symbol).strip()
@@ -347,7 +374,8 @@ class YahooCollectorHK(YahooCollector, ABC):
                     df = _resp.reset_index()
                     #df["used_symbol_for_yahoo"] = cand
                     if interval.lower() == "1d" and "date" in df.columns:
-                        df["date"] = df["date"].astype(str).str[:10]
+                        #df["date"] = df["date"].astype(str).str[:10]
+                        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
                     return df
                 elif isinstance(_resp, dict):
                     _temp_data = _resp.get(cand, {})
@@ -458,11 +486,20 @@ class YahooNormalize(BaseNormalize):
 
     @staticmethod
     def calc_change(df: pd.DataFrame, last_close: float) -> pd.Series:
+        # Protect against missing or entirely-NaN close series
+        if df is None or df.empty or "close" not in df.columns or df["close"].dropna().empty:
+            # return a Series of NaNs with same index shape
+            return pd.Series([np.nan] * (0 if df is None else len(df.index)), index=([] if df is None else df.index))
         df = df.copy()
         _tmp_series = df["close"].ffill()
         _tmp_shift_series = _tmp_series.shift(1)
-        if last_close is not None:
-            _tmp_shift_series.iloc[0] = float(last_close)
+        if last_close is not None and len(_tmp_shift_series) > 0:
+            try:
+                _tmp_shift_series.iloc[0] = float(last_close)
+            except Exception:
+                pass
+        # avoid divide-by-zero by treating zero previous close as NaN
+        _tmp_shift_series = _tmp_shift_series.replace(0, np.nan)
         change_series = _tmp_series / _tmp_shift_series - 1
         return change_series
 
@@ -524,7 +561,13 @@ class YahooNormalize(BaseNormalize):
             # reindex by the filtered DatetimeIndex
             df = df.reindex(cal_index)
         df.sort_index(inplace=True)
-        df.loc[(df["volume"] <= 0) | np.isnan(df["volume"]), list(set(df.columns) - {symbol_field_name})] = np.nan
+        # When volume is 0 or missing it represents no trade that day; keep price columns intact
+        # only nullify the volume column here. The `change` column will be handled after computation.
+        if "volume" in df.columns:
+            # Preserve zero volume (no trades) as 0.0; only treat negative or invalid volumes as missing.
+            neg_mask = df["volume"] < 0
+            if neg_mask.any():
+                df.loc[neg_mask, "volume"] = np.nan
 
         change_series = YahooNormalize.calc_change(df, last_close)
         # NOTE: The data obtained by Yahoo finance sometimes has exceptions
@@ -549,7 +592,19 @@ class YahooNormalize(BaseNormalize):
         df["change"] = YahooNormalize.calc_change(df, last_close)
 
         columns += ["change"]
-        df.loc[(df["volume"] <= 0) | np.isnan(df["volume"]), columns] = np.nan
+        # For rows with no trading volume (volume == 0) or missing volume, keep price columns,
+        # set `change` to NaN. Keep volume==0 as 0.0; only missing volumes remain NaN.
+        if "volume" in df.columns:
+            zero_mask = df["volume"] == 0
+            missing_mask = df["volume"].isna()
+            neg_mask = df["volume"] < 0
+            if "change" in df.columns:
+                # Treat explicit zero-volume (no trades) as no price change
+                if zero_mask.any():
+                    df.loc[zero_mask, "change"] = 0.0
+                # Keep missing or negative volumes as unknown change
+                if (missing_mask | neg_mask).any():
+                    df.loc[missing_mask | neg_mask, "change"] = np.nan
 
         df[symbol_field_name] = symbol
         df.index.names = [date_field_name]
@@ -693,6 +748,12 @@ class YahooNormalize1dExtend(YahooNormalize1d):
 
     def normalize(self, df: pd.DataFrame) -> pd.DataFrame:
         df = super(YahooNormalize1dExtend, self).normalize(df)
+        # If normalization returned no valid rows, skip extension to avoid iloc[0] out-of-bounds
+        if df is None or df.empty:
+            logger.warning(
+                f"{getattr(self, '_symbol_field_name', 'symbol')} normalize returned empty dataframe; skipping extend"
+            )
+            return pd.DataFrame()
         df.set_index(self._date_field_name, inplace=True)
         symbol_name = df[self._symbol_field_name].iloc[0]
         old_symbol_list = self.old_qlib_data.index.get_level_values("instrument").unique().to_list()
@@ -701,6 +762,10 @@ class YahooNormalize1dExtend(YahooNormalize1d):
         old_df = self.old_qlib_data.loc[str(symbol_name).upper()]
         latest_date = old_df.index[-1]
         df = df.loc[latest_date:]
+        # after: df = df.loc[latest_date:]
+        if df.empty:
+            logger.warning(f"{symbol_name} has no new rows after {latest_date}; skipping extension for this symbol")
+            return pd.DataFrame()
         new_latest_data = df.iloc[0]
         old_latest_data = old_df.loc[latest_date]
         for col in self.column_list[:-1]:
@@ -804,6 +869,9 @@ class YahooNormalizeHK:
         return get_calendar_list("HK_ALL")
 
 class YahooNormalizeHK1d(YahooNormalizeHK, YahooNormalize1d):
+    pass
+
+class YahooNormalizeHK1dExtend(YahooNormalizeHK, YahooNormalize1dExtend): 
     pass
 
 
@@ -1108,6 +1176,7 @@ class Run(BaseRun):
         check_data_length: int = None,
         delay: float = 1,
         exists_skip: bool = True,
+        skip_download: bool = False,
     ):
         """update yahoo data to bin
 
@@ -1150,9 +1219,26 @@ class Run(BaseRun):
         if end_date is None:
             end_date = (pd.Timestamp(trading_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
         print(f"end_date: {end_date}")
-        # download data from yahoo
+        # download data from yahoo (can be skipped via flag)
         # NOTE: when downloading data from YahooFinance, max_workers is recommended to be 1
-        self.download_data(delay=delay, start=trading_date, end=end_date, check_data_length=check_data_length)
+        if not skip_download:
+            self.download_data(delay=delay, start=trading_date, end=end_date, check_data_length=check_data_length)
+        else:
+            logger.info(
+                f"skip_download=True: reusing existing raw source files in {Path(self.source_dir).expanduser()}"
+            )
+            try:
+                src_dir = Path(self.source_dir).expanduser()
+                if not src_dir.exists():
+                    logger.warning(f"source_dir does not exist: {src_dir}")
+                else:
+                    has_csv = any(src_dir.glob("*.csv"))
+                    if not has_csv:
+                        logger.warning(
+                            "No CSV files found in source_dir; normalization may have nothing to process."
+                        )
+            except Exception:
+                pass
         # NOTE: a larger max_workers setting here would be faster
         self.max_workers = (
             max(multiprocessing.cpu_count() - 2, 1)

@@ -809,6 +809,26 @@ def main(args):
             net = bull - bear
             liq_ok = avg_dollar.get(inst, 0.0) >= float(args.liq_threshold)
             buy_flag = (bull > bear) and liq_ok
+            # determine listing age (number of available trading days with non-null close)
+            try:
+                hist = D.features([inst], ["$close"], start_time="2005-01-01", end_time=target_day, freq="day", disk_cache=True)
+                # extract series for instrument if needed
+                if isinstance(hist, pd.DataFrame):
+                    if "instrument" in hist.index.names:
+                        try:
+                            s_close = hist.xs(inst, level="instrument")[hist.columns[0]]
+                        except Exception:
+                            s_close = hist.iloc[:, 0]
+                    else:
+                        s_close = hist.iloc[:, 0]
+                    listed_days = int(s_close.dropna().shape[0])
+                else:
+                    listed_days = 0
+            except Exception:
+                listed_days = 0
+
+            is_new_listing = bool(listed_days < 120)
+
             rows.append({
                 "instrument": inst,
                 "bull_score": bull,
@@ -819,6 +839,8 @@ def main(args):
                 "model_score": float(model_scores.get(inst, 0.0)),
                 "chinese_name": resolve_chinese(inst),
                 **snap,
+                "newly_listed_days": int(listed_days),
+                "is_new_listing": bool(is_new_listing),
             })
         except Exception as e:
             rows.append({
@@ -843,7 +865,7 @@ def main(args):
     print(f"Saved decision table to {out_path}")
 
     # print concise table (sorted by composite = model_score * net_score)
-    base_cols = ["instrument", "chinese_name", "model_score", "bull_score", "bear_score", "net_score", "avg_dollar_vol", "buy"]
+    base_cols = ["instrument", "chinese_name", "model_score", "bull_score", "bear_score", "net_score", "avg_dollar_vol", "is_new_listing", "buy"]
     disp = out_df[base_cols].copy()
     disp["composite_score"] = disp["model_score"].fillna(0.0) * disp["net_score"].fillna(0.0)
     # Improve East Asian alignment in console
@@ -861,8 +883,11 @@ def main(args):
     view["avg_dollar_vol"] = view["avg_dollar_vol"].map(lambda x: f"{int(x):,}")
     print("\nDecision preview (sorted by composite = model_score * net_score):")
     # reorder columns for display
-    disp_cols = ["instrument", "chinese_name", "model_score", "bull_score", "bear_score", "net_score", "composite_score", "avg_dollar_vol", "buy"]
+    disp_cols = ["instrument", "chinese_name", "model_score", "bull_score", "bear_score", "net_score", "composite_score", "avg_dollar_vol", "is_new_listing", "buy"]
     try:
+        # ensure is_new_listing shown as True/False string
+        if "is_new_listing" in view.columns:
+            view["is_new_listing"] = view["is_new_listing"].map(lambda x: "True" if bool(x) else "False")
         print(view[disp_cols].to_string(index=False))
     except Exception:
         print(view[disp_cols])
@@ -870,10 +895,10 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--recorder_id", required=True, help="recorder/run id")
+    parser.add_argument("--recorder_id", default="9e51767a8a1842f7889118799b99d6a0", help="recorder/run id")
     parser.add_argument("--experiment_name", default="workflow", help="experiment name (unused here)")
     parser.add_argument("--provider_uri", default="~/.qlib/qlib_data/hk_data", help="qlib data dir")
-    parser.add_argument("--topk", type=int, default=10, help="number of instruments to score")
+    parser.add_argument("--topk", type=int, default=20, help="number of instruments to score")
     parser.add_argument("--lookback", type=int, default=180, help="lookback days for indicators")
     parser.add_argument("--liq_threshold", type=float, default=1000000.0, help="avg dollar vol gate")
     parser.add_argument("--liq_window", type=int, default=20, help="window for avg dollar vol")

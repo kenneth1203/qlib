@@ -460,6 +460,20 @@ def get_hk_stock_symbols(qlib_data_path: [str, Path] = None) -> list:
             # dedupe and cache
             symbols = sorted(set(symbols))
 
+            # Keep only 5-digit HK stock codes that start with '0'
+            # e.g. '00001.HK', '00700.HK' -> keep; drop others like '80000.HK'
+            try:
+                filtered_symbols = [s for s in symbols if re.match(r"^0\d{4}\.HK$", s)]
+                if filtered_symbols:
+                    symbols = filtered_symbols
+                else:
+                    logger.warning(
+                        "No HK symbols matched '^0\\d{4}\\.HK$' pattern — returning original set (no filtering applied)."
+                    )
+            except Exception:
+                # In case of any unexpected issue with filtering, fall back to original list
+                logger.warning("Failed to filter HK symbols by pattern; returning unfiltered symbols.")
+
             symbol_cache_path = Path("~/.cache/hk_symbols_cache.pkl").expanduser().resolve()
             symbol_cache_path.parent.mkdir(parents=True, exist_ok=True)
             try:
