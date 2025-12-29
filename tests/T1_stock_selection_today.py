@@ -12,11 +12,16 @@ import copy
 import datetime
 import os
 import pickle
+from typing import Optional
+
 import qlib
 from qlib.workflow import R
 from qlib.utils import init_instance_by_config
 from qlib.constant import REG_HK
 from wcwidth import wcswidth
+
+from qlib.utils.notify import TelegramNotifier, resolve_notify_params
+from qlib.utils.func import to_qlib_inst
 
 
 def _disp_width(x):
@@ -42,7 +47,7 @@ def _pad_left(s, width):
     return " " * (width - cur) + s
 
 
-def main(recorder_id, experiment_name, provider_uri, topk):
+def main(recorder_id, experiment_name, provider_uri, topk, notifier: Optional[TelegramNotifier] = None):
     provider_uri = os.path.expanduser(provider_uri)
     qlib.init(provider_uri=provider_uri, region=REG_HK)
 
@@ -205,16 +210,6 @@ def main(recorder_id, experiment_name, provider_uri, topk):
             top = ss.sort_values(ascending=False).head(max(topk, 500))
 
             # --- Select top-k (liquidity pre-filter already applied via handler) ---
-            def to_qlib_inst(x: str) -> str:
-                s = str(x).lower()
-                if s.startswith("hk."):
-                    s = s.split(".", 1)[1]
-                if "." in s:
-                    s = s.split(".", 1)[0]
-                if s.isdigit():
-                    s = s.zfill(5)
-                return s.upper() + ".HK"
-
             cand_insts = [to_qlib_inst(i) for i in top.index]
             selected = cand_insts[:topk]
 
@@ -301,20 +296,47 @@ def main(recorder_id, experiment_name, provider_uri, topk):
                 print(f"\nTop {topk} instruments for {target_day}:")
                 print(hdr)
                 # rows (display-aware padding)
+                lines = [hdr]
                 for _, r in view_df.iterrows():
                     id_s = r['id'] if pd.notna(r['id']) else ''
                     name_s = r['name'] if pd.notna(r['name']) else ''
                     score_s = r['_score_s'] if pd.notna(r['_score_s']) else ''
                     avg_s = r['_avg_s'] if pd.notna(r['_avg_s']) else ''
-                    print(f"{_pad_right(id_s, widths['id'])}  {_pad_right(name_s, widths['name'])}  {_pad_left(score_s, widths['_score_s'])}  {_pad_left(avg_s, widths['_avg_s'])}")
+                    row_s = f"{_pad_right(id_s, widths['id'])}  {_pad_right(name_s, widths['name'])}  {_pad_left(score_s, widths['_score_s'])}  {_pad_left(avg_s, widths['_avg_s'])}"
+                    print(row_s)
+                    lines.append(row_s)
     except Exception:
         print("Prediction result:", pred)
 
-    # save prediction locally
-    out_path = f"pred_today_{recorder_id}.pkl"
-    with open(out_path, "wb") as f:
+    # save prediction locally (dated file) and keep legacy name for compatibility
+    day_str = pd.to_datetime(target_day).strftime("%Y%m%d")
+    out_dated = f"pred_{day_str}_{recorder_id}.pkl"
+    with open(out_dated, "wb") as f:
         pickle.dump(pred, f)
-    print(f"Saved prediction to {out_path}")
+    print(f"Saved prediction to {out_dated}")
+
+    out_legacy = f"pred_today_{recorder_id}.pkl"
+    try:
+        with open(out_legacy, "wb") as f:
+            pickle.dump(pred, f)
+        print(f"Saved legacy prediction to {out_legacy}")
+    except Exception as e:
+        print(f"Warning: failed to write legacy pred file {out_legacy}: {e}")
+
+    if notifier:
+        preview = ", ".join(selected) if 'selected' in locals() else ""
+        table_lines = []
+        if 'lines' in locals():
+            table_lines = lines
+        notifier.send(
+            "\n".join(
+                [
+                    f"T1 selection for {target_day}",
+                    f"recorder_id: {recorder_id}",
+                ]
+                + table_lines
+            )
+        )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -322,6 +344,9 @@ if __name__ == "__main__":
     parser.add_argument("--experiment_name", default="workflow", help="experiment name")
     parser.add_argument("--provider_uri", default="~/.qlib/qlib_data/hk_data", help="qlib data dir")
     parser.add_argument("--topk", type=int, default=20, help="print top-k instruments")
+    parser.add_argument("--telegram_token", help="telegram bot token (optional)")
+    parser.add_argument("--telegram_chat_id", help="telegram chat id (optional)")
+    parser.add_argument("--notify_config", help="path to JSON config with telegram_token/chat_id")
     args = parser.parse_args()
     # If recorder_id not provided, pick latest run folder under ./mlruns
     if args.recorder_id is None:
@@ -346,4 +371,6 @@ if __name__ == "__main__":
         if args.recorder_id is None:
             print("No recorder_id provided and no runs found in ./mlruns. Please supply --recorder_id")
             raise SystemExit(1)
-    main(args.recorder_id, args.experiment_name, args.provider_uri, args.topk)
+    tok, chat = resolve_notify_params(args.telegram_token, args.telegram_chat_id, args.notify_config)
+    notifier = TelegramNotifier(tok, chat)
+    main(args.recorder_id, args.experiment_name, args.provider_uri, args.topk, notifier)

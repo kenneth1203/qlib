@@ -22,7 +22,9 @@ import argparse
 import os
 import datetime
 import sys
-from typing import List, Dict
+import re
+from pathlib import Path
+from typing import List, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -32,7 +34,18 @@ from qlib.constant import REG_HK
 from qlib.workflow import R
 from qlib.data import D
 from qlib.utils.indicators import score_instrument, atr
+from qlib.utils.func import (
+    next_trading_day_from_future,
+    to_qlib_inst,
+    load_chinese_name_map,
+    resolve_chinese,
+)
 import matplotlib.pyplot as plt
+from qlib.utils.notify import TelegramNotifier, resolve_notify_params
+try:
+    from tqdm.auto import tqdm as _tqdm  # type: ignore
+except Exception:
+    _tqdm = None
 
 # ---- Kronos imports (optional) ----
 _KRONOS_AVAILABLE = True
@@ -51,18 +64,6 @@ except Exception:
     except Exception:
         _KRONOS_AVAILABLE = False
 
-
-def to_qlib_inst(x: str) -> str:
-    s = str(x).lower()
-    if s.startswith("hk."):
-        s = s.split(".", 1)[1]
-    if "." in s:
-        s = s.split(".", 1)[0]
-    if s.isdigit():
-        s = s.zfill(5)
-    return s.upper() + ".HK"
-
-
 def calendar_last_day(today: datetime.date) -> str:
     cal = D.calendar(
         start_time=(today - datetime.timedelta(days=14)).strftime("%Y-%m-%d"),
@@ -70,6 +71,31 @@ def calendar_last_day(today: datetime.date) -> str:
         freq="day",
     )
     return today.strftime("%Y-%m-%d") if len(cal) == 0 else cal[-1]
+
+
+def _dated_pred_path(recorder_id: str, target_day: str) -> Path:
+    day_str = pd.to_datetime(target_day).strftime("%Y%m%d")
+    return Path(f"pred_{day_str}_{recorder_id}.pkl")
+
+
+def _list_dated_pred_paths(recorder_id: str, target_day: str, lookback_days: int) -> List[Path]:
+    paths: List[Path] = []
+    target_ts = pd.to_datetime(target_day)
+    start_ts = target_ts - pd.Timedelta(days=lookback_days * 2)
+    pat = f"pred_*_{recorder_id}.pkl"
+    for p in Path('.').glob(pat):
+        name = p.name
+        m = re.match(r"pred_(\d{8})_" + re.escape(recorder_id) + r"\.pkl", name)
+        if not m:
+            continue
+        try:
+            dt = pd.to_datetime(m.group(1))
+        except Exception:
+            continue
+        if dt <= target_ts and dt >= start_ts:
+            paths.append(p)
+    paths_sorted = sorted(paths, key=lambda x: x.name)
+    return paths_sorted
 
 
 def load_selection(recorder_id: str, topk: int, target_day: str) -> List[str]:
@@ -84,8 +110,11 @@ def load_selection(recorder_id: str, topk: int, target_day: str) -> List[str]:
             return [to_qlib_inst(i) for i in df[cols[0]].astype(str).tolist()][:topk]
 
     # fallback: load prediction pickle
-    pkl_path = f"pred_today_{recorder_id}.pkl"
-    if not os.path.exists(pkl_path):
+    dated_path = _dated_pred_path(recorder_id, target_day)
+    legacy_path = Path(f"pred_today_{recorder_id}.pkl")
+    pkl_path = dated_path if dated_path.exists() else legacy_path
+    print(f"load_selection using pred file: {pkl_path}")
+    if not pkl_path.exists():
         raise RuntimeError(f"Missing selection CSV and prediction pickle: {csv_path}, {pkl_path}")
 
     pred = pd.read_pickle(pkl_path)
@@ -125,9 +154,12 @@ def load_model_scores(recorder_id: str, target_day: str) -> Dict[str, float]:
     """Load per-instrument model scores from pred_today_<recorder_id>.pkl."""
     model_scores: Dict[str, float] = {}
     try:
-        pkl_path = f"pred_today_{recorder_id}.pkl"
-        if not os.path.exists(pkl_path):
+        dated_path = _dated_pred_path(recorder_id, target_day)
+        legacy_path = Path(f"pred_today_{recorder_id}.pkl")
+        pkl_path = dated_path if dated_path.exists() else legacy_path
+        if not pkl_path.exists():
             return model_scores
+        print(f"load_model_scores using pred file: {pkl_path}")
 
         pred = pd.read_pickle(pkl_path)
         s = pred.iloc[:, 0] if isinstance(pred, pd.DataFrame) else pred
@@ -165,81 +197,88 @@ def load_model_scores(recorder_id: str, target_day: str) -> Dict[str, float]:
     return model_scores
 
 
-def load_chinese_name_map() -> Dict[str, str]:
-    """Return mapping of instrument code -> Chinese name with robust key variants."""
-    chinese_name: Dict[str, str] = {}
+def load_selection_history(recorder_id: str, topk: int, target_day: str, lookback_days: int = 30) -> Dict[str, List[str]]:
+    """Load per-day selections from pred_today_<recorder_id>.pkl for streak counting."""
+    history: Dict[str, List[str]] = {}
     try:
-        name_paths = [
-            os.path.join(os.path.expanduser("~"), ".qlib", "qlib_data", "hk_data", "boardlot", "chinese_name.txt"),
-            r"C:\\Users\\kennethlao\\.qlib\\qlib_data\\hk_data\\boardlot\\chinese_name.txt",
-        ]
-        lines = []
-        for p in name_paths:
-            if os.path.exists(p):
-                try:
-                    with open(p, "r", encoding="utf-8") as fh:
-                        lines = fh.readlines()
-                except Exception:
+        paths = _list_dated_pred_paths(recorder_id, target_day, lookback_days)
+        legacy_path = Path(f"pred_today_{recorder_id}.pkl")
+        if not paths and legacy_path.exists():
+            paths = [legacy_path]
+        if not paths:
+            return history
+
+        for pkl_path in paths:
+            print(f"load_selection_history reading: {pkl_path}")
+            pred = pd.read_pickle(pkl_path)
+            s = pred.iloc[:, 0] if isinstance(pred, pd.DataFrame) else pred
+            if not isinstance(s, pd.Series):
+                continue
+
+            names = list(getattr(s.index, "names", []))
+            if "datetime" not in names:
+                continue
+            dt_level = names.index("datetime")
+            inst_level = names.index("instrument") if "instrument" in names else None
+
+            grouped = s.groupby(level=dt_level)
+            for dt_val, series in grouped:
+                ss = series
+                if isinstance(ss.index, pd.MultiIndex) and inst_level is not None and len(ss.index.names) > 1:
                     try:
-                        with open(p, "r", encoding="gb18030") as fh:
-                            lines = fh.readlines()
+                        ss = ss.groupby(level=inst_level).last()
                     except Exception:
-                        lines = []
-                break
+                        keep = [inst_level]
+                        drop_levels = [n for i, n in enumerate(ss.index.names) if i not in keep]
+                        ss = ss.droplevel(drop_levels)
+                top = ss.sort_values(ascending=False).head(max(topk, 500))
+                day_str = pd.Timestamp(dt_val).strftime("%Y-%m-%d")
+                history[day_str] = [to_qlib_inst(i) for i in top.index][:topk]
 
-        def add_name_keys(code: str, name: str):
-            c = code.strip()
-            c_low = c.lower()
-            if c_low.startswith("hk."):
-                num = c_low.split(".", 1)[1]
-            elif c_low.endswith(".hk"):
-                num = c_low.split(".", 1)[0]
-            else:
-                num = c_low
-            num5 = num.zfill(5) if num.isdigit() else num
-            keys = {
-                num5 + ".hk",
-                num5.upper() + ".HK",
-                "hk." + num5,
-                "HK." + num5,
-                num5,
-                num5.upper(),
-            }
-            for k in keys:
-                chinese_name[k] = name
-
-        for ln in lines:
-            parts = ln.strip().split()
-            if len(parts) >= 2:
-                code = parts[0]
-                name = " ".join(parts[1:])
-                add_name_keys(code, name)
+        try:
+            target_ts = pd.to_datetime(target_day)
+            cutoff = target_ts - pd.Timedelta(days=lookback_days * 2)
+            history = {d: v for d, v in history.items() if pd.to_datetime(d) >= cutoff and pd.to_datetime(d) <= target_ts}
+        except Exception:
+            pass
     except Exception:
-        chinese_name = {}
-    return chinese_name
+        history = {}
+    return history
 
 
-def resolve_chinese(inst_code: str, chinese_map: Dict[str, str]) -> str:
-    base = inst_code.split(".", 1)[0]
-    candidates = [
-        inst_code,
-        inst_code.lower(),
-        base,
-        base.lower(),
-        base.upper(),
-        base.zfill(5),
-        base.zfill(5).lower(),
-        base.zfill(5).upper(),
-        f"{base.zfill(5)}.hk",
-        f"{base.zfill(5)}.HK",
-        f"hk.{base.zfill(5)}",
-        f"HK.{base.zfill(5)}",
-    ]
-    for k in candidates:
-        if k in chinese_map:
-            return chinese_map[k]
-    return ""
+def compute_consecutive_selected(selected_today: List[str], selection_history: Dict[str, List[str]], target_day: str, lookback_days: int = 30) -> Dict[str, int]:
+    """Return consecutive-day selection streaks ending at target_day (trading days only)."""
+    counts: Dict[str, int] = {inst: 1 for inst in selected_today}
+    try:
+        target_ts = pd.to_datetime(target_day)
+        start_ts = target_ts - pd.Timedelta(days=lookback_days)
+        cal = D.calendar(start_time=start_ts.strftime("%Y-%m-%d"), end_time=target_ts.strftime("%Y-%m-%d"), freq="day")
+        cal_ts = [pd.Timestamp(d) for d in cal if pd.Timestamp(d) <= target_ts]
+    except Exception:
+        cal_ts = [pd.to_datetime(target_day)]
 
+    day_str = pd.to_datetime(target_day).strftime("%Y-%m-%d")
+    history = dict(selection_history)
+    if day_str not in history:
+        history[day_str] = list(selected_today)
+
+    for inst in selected_today:
+        streak = 0
+        for dt_val in reversed(cal_ts):
+            dstr = pd.Timestamp(dt_val).strftime("%Y-%m-%d")
+            picks = history.get(dstr)
+            if picks is None:
+                if dstr == day_str:
+                    streak += 1
+                else:
+                    break
+            elif inst in picks:
+                streak += 1
+            else:
+                break
+        counts[inst] = streak
+
+    return counts
 
 def fetch_ohlcv(instruments: List[str], start_dt: str, end_dt: str) -> pd.DataFrame:
     # try to include $open, $vwap, and $amount if available for Kronos input
@@ -475,7 +514,8 @@ def make_kronos_scorer(predictor, args):
                 return float("nan")
 
             look = min(int(args.kronos_lookback), len(kdf_clean))
-            print(f"Kronos processing {inst_code}: using lookback={look} from available {len(kdf_clean)} rows")
+            if getattr(args, "kronos_debug", False):
+                print(f"Kronos processing {inst_code}: using lookback={look} from available {len(kdf_clean)} rows")
             x_df = kdf_clean.tail(look)
             x_timestamp = pd.Series(pd.to_datetime(x_df.index))
             last_dt = pd.to_datetime(kdf.index[-1]).to_pydatetime().date()
@@ -490,7 +530,8 @@ def make_kronos_scorer(predictor, args):
                 if getattr(args, "kronos_debug", False):
                     print(f"Kronos calendar fallback for {inst_code}: no future trading days from {last_dt}; using pandas bdate_range")
                 start_pd = pd.Timestamp(last_dt) + pd.Timedelta(days=1)
-                print(f"Kronos predict start date for {inst_code}: {start_pd.strftime('%Y-%m-%d')} for {int(args.kronos_pred_len)} days")
+                if getattr(args, "kronos_debug", False):
+                    print(f"Kronos predict start date for {inst_code}: {start_pd.strftime('%Y-%m-%d')} for {int(args.kronos_pred_len)} days")
                 y_timestamp = pd.Series(pd.bdate_range(start=start_pd, periods=int(args.kronos_pred_len), freq="B"))
             if len(y_timestamp) < int(args.kronos_pred_len):
                 if getattr(args, "kronos_debug", False):
@@ -503,7 +544,7 @@ def make_kronos_scorer(predictor, args):
                 pred_len=args.kronos_pred_len,
                 T=1.0,
                 top_p=0.9,
-                sample_count=5,
+                sample_count=10,
                 verbose=False,
             )
 
@@ -554,13 +595,15 @@ def make_kronos_scorer(predictor, args):
                     r = 0.0
                 else:
                     returns = (pred_close_series / last_close) - 1.0
-                    r = float(returns.mean())
+                    # Trim extreme paths, then average to avoid所有樣本都被頂到同一個截斷值
+                    trimmed = returns.clip(lower=-0.05, upper=0.05)
+                    r = float(trimmed.mean())
                 if getattr(args, "kronos_debug", False):
                     try:
                         dates = y_timestamp.dt.strftime("%Y-%m-%d").tolist()
                     except Exception:
                         dates = [str(x) for x in y_timestamp.tolist()]
-                    print(f"Kronos pred {inst_code}: horizon_days={len(returns)}, dates={dates[:min(5,len(dates))]}..., last_close={last_close:.4f}, avg_pred_close={pred_close_series.mean():.4f}, avg_ret={r:.4%}")
+                    print(f"Kronos pred {inst_code}: horizon_days={len(returns)}, dates={dates[:min(5,len(dates))]}..., last_close={last_close:.4f}, avg_pred_close={pred_close_series.mean():.4f}, median_ret_clip={r:.4%}")
                 alpha = float(getattr(args, "kronos_sigmoid_alpha", 5.0))
                 s = 1.0 / (1.0 + np.exp(-alpha * r))
                 return float(s)
@@ -603,7 +646,7 @@ def compute_final_score(model_score, kronos_score, net_score, vol_ratio):
 def buy_filter(row, liq_threshold: float, final_threshold: float):
     try:
         ks = row.get("kronos_score", np.nan)
-        if pd.notna(ks) and float(ks) < 0.6:
+        if pd.notna(ks) and float(ks) < 0.5:
             return False
     except Exception:
         return False
@@ -630,26 +673,7 @@ def buy_filter(row, liq_threshold: float, final_threshold: float):
 
     return True
 
-def plot_prediction(history_df, pred_df, symbol):
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
-
-    ax1.plot(history_df.index, history_df["close"], label="History", color="tab:blue", linewidth=1.4)
-    ax1.plot(pred_df.index, pred_df["close"], label="Prediction", color="tab:red", linewidth=1.6)
-    ax1.set_title(f"{symbol} - Close price forecast", fontsize=14)
-    ax1.set_ylabel("Close", fontsize=12)
-    ax1.legend(loc="best", fontsize=11)
-    ax1.grid(True, alpha=0.3)
-
-    ax2.bar(history_df.index, history_df["volume"], label="History", color="tab:blue", width=0.8)
-    ax2.bar(pred_df.index, pred_df["volume"], label="Prediction", color="tab:red", width=0.8, alpha=0.7)
-    ax2.set_ylabel("Volume", fontsize=12)
-    ax2.legend(loc="best", fontsize=11)
-    ax2.grid(True, axis="y", alpha=0.3)
-
-    plt.tight_layout()
-    plt.show()
-
-def main(args):
+def main(args, notifier: Optional[TelegramNotifier] = None):
     provider_uri = os.path.expanduser(args.provider_uri)
     qlib.init(provider_uri=provider_uri, region=REG_HK)
 
@@ -657,12 +681,15 @@ def main(args):
     target_day = calendar_last_day(today_dt)
     print("target_day:", target_day)
 
+    msg_day = next_trading_day_from_future(provider_uri, target_day) or target_day
+
     selected = load_selection(args.recorder_id, args.topk, target_day)
     if len(selected) == 0:
         raise RuntimeError("No selected instruments.")
     print("Selected:", selected)
 
     model_scores = load_model_scores(args.recorder_id, target_day)
+    selection_history = load_selection_history(args.recorder_id, args.topk, target_day, lookback_days=30)
     chinese_map = load_chinese_name_map()
 
     start_dt = (pd.to_datetime(target_day) - pd.Timedelta(days=args.lookback)).strftime("%Y-%m-%d")
@@ -723,8 +750,13 @@ def main(args):
         "allow_partial": bool(getattr(args, "allow_partial", False)),
     }
 
+    consecutive_counts = compute_consecutive_selected(selected, selection_history, target_day, lookback_days=30)
     rows = []
-    for inst in selected:
+    iter_inst = selected
+    use_kronos_bar = (_tqdm is not None) and (kronos_predictor is not None)
+    if use_kronos_bar:
+        iter_inst = _tqdm(selected, desc="Kronos scoring", leave=False)
+    for inst in iter_inst:
         try:
             df_inst = ohlcv.xs(inst, level="instrument")
             bull, bear, snap = score_instrument(df_inst, params)
@@ -762,6 +794,7 @@ def main(args):
                 **snap,
                 "newly_listed_days": int(listed_days),
                 "is_new_listing": bool(is_new_listing),
+                "streak_days": int(consecutive_counts.get(inst, 1)),
             })
         except Exception as e:
             rows.append({
@@ -772,6 +805,7 @@ def main(args):
                 "net_score": -1,
                 "avg_dollar_vol": int(round(avg_dollar.get(inst, 0.0))),
                 "buy": False,
+                "streak_days": 0,
             })
 
     out_df = pd.DataFrame(rows)
@@ -805,6 +839,7 @@ def main(args):
         "avg_dollar_vol": 0.0,
         "is_new_listing": False,
         "buy": False,
+        "streak_days": 0,
     }.items():
         if col not in out_df.columns:
             out_df[col] = default
@@ -823,6 +858,7 @@ def main(args):
         "bear_score",
         "net_c",
         "final_score",
+        "streak_days",
         "avg_dollar_vol",
         "is_new_listing",
         "buy",
@@ -835,7 +871,7 @@ def main(args):
     out_df[preferred + remaining].to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"Saved decision table to {out_path}")
 
-    base_cols = ["instrument", "chinese_name", "model_score", "kronos_score", "bull_score", "bear_score", "net_c", "final_score", "avg_dollar_vol", "is_new_listing", "buy"]
+    base_cols = ["instrument", "chinese_name", "model_score", "kronos_score", "bull_score", "bear_score", "net_c", "final_score", "streak_days", "avg_dollar_vol", "is_new_listing", "buy"]
     disp = out_df[base_cols].copy()
     try:
         pd.set_option("display.unicode.east_asian_width", True)
@@ -850,15 +886,48 @@ def main(args):
     if "net_c" in view.columns:
         view["net_c"] = view["net_c"].map(lambda x: ("" if pd.isna(x) else f"{x:.6f}"))
     view["final_score"] = view["final_score"].map(lambda x: f"{x:.3f}")
+    if "streak_days" in view.columns:
+        view["streak_days"] = view["streak_days"].map(lambda x: f"{int(x)}")
     view["avg_dollar_vol"] = view["avg_dollar_vol"].map(lambda x: f"{int(x):,}")
-    print(f"\nDecision preview: buy = (kronos>=0.6) & (not new) & (liq>={int(args.liq_threshold):,}) & (bull>bear) & (final_score>={args.final_threshold:.3f}).")
-    disp_cols = ["instrument", "chinese_name", "model_score", "kronos_score", "bull_score", "bear_score", "net_c", "final_score", "avg_dollar_vol", "is_new_listing", "buy"]
+    print(f"\nDecision preview: buy = (kronos>=0.5) & (not new) & (liq>={int(args.liq_threshold):,}) & (bull>bear) & (final_score>={args.final_threshold:.3f}).")
+    disp_cols = ["instrument", "chinese_name", "model_score", "kronos_score", "bull_score", "bear_score", "net_c", "final_score", "streak_days", "avg_dollar_vol", "is_new_listing", "buy"]
     try:
         if "is_new_listing" in view.columns:
             view["is_new_listing"] = view["is_new_listing"].map(lambda x: "True" if bool(x) else "False")
         print(view[disp_cols].to_string(index=False))
     except Exception:
         print(view[disp_cols])
+
+    if notifier:
+        lines = [
+            f"T2 decision for {msg_day}",
+            f"recorder_id: {args.recorder_id}",
+        ]
+        table_lines = []
+        try:
+            mobile_cols = ["instrument", "chinese_name", "final_score", "buy", "kronos_score", "model_score", "net_c", "streak_days"]
+            v2 = view[mobile_cols].copy()
+            v2["final_score"] = v2["final_score"].astype(str)
+            v2["kronos_score"] = v2.get("kronos_score", "").astype(str)
+            v2["model_score"] = v2.get("model_score", "").astype(str)
+            v2["net_c"] = v2.get("net_c", "").astype(str)
+            widths = {c: max(len(str(c)), int(v2[c].map(lambda x: len(str(x))).max())) for c in mobile_cols}
+            header = " ".join([str(c).ljust(widths[c]) for c in mobile_cols])
+            table_lines.append(header)
+            for _, row in v2.iterrows():
+                cells = [str(row[c]).ljust(widths[c]) for c in mobile_cols]
+                table_lines.append(" ".join(cells))
+        except Exception:
+            try:
+                table_lines.append(view[disp_cols].to_string(index=False))
+            except Exception:
+                pass
+        # If Markdown is enabled, wrap the table in a code block to avoid parsing issues
+        if isinstance(notifier, TelegramNotifier) and getattr(notifier, 'parse_mode', None):
+            payload_lines = lines + ["```"] + table_lines + ["```"]
+            notifier.send("\n".join(payload_lines))
+        else:
+            notifier.send("\n".join(lines + table_lines))
 
 
 if __name__ == "__main__":
@@ -871,18 +940,22 @@ if __name__ == "__main__":
     parser.add_argument("--liq_threshold", type=float, default=5000000.0, help="avg dollar vol gate")
     parser.add_argument("--liq_window", type=int, default=20, help="window for avg dollar vol")
     parser.add_argument("--allow_partial", action="store_true", help="allow partial scoring for insufficient-history instruments (skip missing indicators instead of penalizing)")
-    parser.add_argument("--final_threshold", type=float, default=5.0, help="minimum final_score threshold for buy filter")
+    parser.add_argument("--final_threshold", type=float, default=2.0, help="minimum final_score threshold for buy filter")
     # Kronos options
-    parser.add_argument("--enable_kronos", action="store_true", help="enable Kronos 7-day uptrend scoring (default off)")
+    parser.add_argument("--enable_kronos", action="store_true", default=True, help="enable Kronos 7-day uptrend scoring (default on)")
     parser.add_argument("--kronos_model", default="NeoQuasar/Kronos-base", help="Kronos model name or path (default Kronos-small)")
     parser.add_argument("--kronos_device", default="cuda:0", help="device for Kronos (e.g., cpu or cuda:0)")
     parser.add_argument("--kronos_lookback", type=int, default=300, help="lookback bars for Kronos input")
-    parser.add_argument("--kronos_pred_len", type=int, default=7, help="prediction horizon for Kronos (days)")
+    parser.add_argument("--kronos_pred_len", type=int, default=14, help="prediction horizon for Kronos (days)")
     parser.add_argument("--kronos_max_context", type=int, default=512, help="max context tokens for Kronos predictor")
-    parser.add_argument("--kronos_sigmoid_alpha", type=float, default=10.0, help="alpha for deterministic sigmoid mapping of 7D return")
+    parser.add_argument("--kronos_sigmoid_alpha", type=float, default=5.0, help="alpha for deterministic sigmoid mapping of 7D return")
     parser.add_argument("--kronos_debug", action="store_true", help="print Kronos debug info when scoring fails")
     parser.add_argument("--kronos_min_bars", type=int, default=100, help="minimum number of bars required to run Kronos scoring")
-    parser.add_argument("--kronos_fill_missing", action="store_true", help="ffill/bfill missing OHLCV/amount before Kronos input cleaning")
+    parser.add_argument("--kronos_fill_missing", action="store_true", default=True, help="ffill/bfill missing OHLCV/amount before Kronos input cleaning (default on)")
+    parser.add_argument("--telegram_token", help="telegram bot token (optional)")
+    parser.add_argument("--telegram_chat_id", help="telegram chat id (optional)")
+    parser.add_argument("--notify_config", help="path to JSON config with telegram_token/chat_id")
+    parser.add_argument("--telegram_markdown", action="store_true", help="send Telegram using Markdown and wrap tables in code block")
     args = parser.parse_args()
     # If recorder_id not provided, pick latest run folder under ./mlruns
     if args.recorder_id is None:
@@ -907,4 +980,6 @@ if __name__ == "__main__":
         if args.recorder_id is None:
             print("No recorder_id provided and no runs found in ./mlruns. Please supply --recorder_id")
             raise SystemExit(1)
-    main(args)
+    tok, chat = resolve_notify_params(args.telegram_token, args.telegram_chat_id, args.notify_config)
+    notifier = TelegramNotifier(tok, chat, parse_mode=("Markdown" if getattr(args, "telegram_markdown", False) else None))
+    main(args, notifier)
