@@ -11,7 +11,7 @@ from model import Kronos, KronosTokenizer, KronosPredictor
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Kronos HK 7-day forecast using qlib bin data")
-    parser.add_argument("--symbol", default="00001.HK", help="HK ticker, e.g. 00001.HK")
+    parser.add_argument("--symbol", default="06168.HK", help="HK ticker, e.g. 00001.HK")
     parser.add_argument("--provider_uri", default="~/.qlib/qlib_data/hk_data", help="qlib bin data path")
     parser.add_argument("--lookback", type=int, default=300, help="history days fed into Kronos")
     parser.add_argument("--min_history", type=int, default=60, help="minimum clean history required before fallback")

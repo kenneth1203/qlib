@@ -60,7 +60,7 @@ HK_GBDT_TASK = {
 }
 
 
-def compute_liquid_instruments(liq_threshold=500_000, liq_window=20, handler_end_time=None):
+def compute_liquid_instruments(liq_threshold=1_000_000, liq_window=20, handler_end_time=None):
     """Return instruments that pass rolling dollar-volume filter.
 
     Parameters
@@ -142,7 +142,7 @@ if __name__ == "__main__":
     # --- Liquidity filter: reuse helper for consistent universe ---
     handler_kwargs = HK_GBDT_TASK["dataset"]["kwargs"]["handler"]["kwargs"]
     keep_insts, info = compute_liquid_instruments(
-        liq_threshold=500_000,
+        liq_threshold=5_000_000,
         liq_window=20,
         handler_end_time=handler_kwargs.get("end_time", None),
     )
@@ -209,8 +209,8 @@ if __name__ == "__main__":
             "module_path": "qlib.contrib.strategy.signal_strategy",
             "kwargs": {
                 "signal": (model, dataset),
-                "topk": 8,
-                "n_drop": 2,
+                "topk": 20,
+                "n_drop": 5,
                 "only_tradable": True,
                 "forbid_all_trade_at_limit": True
             },
@@ -218,7 +218,7 @@ if __name__ == "__main__":
         "backtest": {
             "start_time": "2022-01-01",   # ✅ 與 test 對齊
             "end_time":   "2025-12-17",   # ✅ 與 test 對齊
-            "account": 1000000,
+            "account": 10000000,
             "benchmark": HK_BENCH,
             "exchange_kwargs": {
                 "freq": "day",

@@ -507,14 +507,15 @@ class QlibConfig(Config):
 
     def reset_qlib_version(self):
         import qlib  # pylint: disable=C0415
-
+    
         reset_version = self.get("qlib_reset_version", None)
         if reset_version is not None:
             qlib.__version__ = reset_version
         else:
-            qlib.__version__ = getattr(qlib, "__version__bak")
-            # Due to a bug? that converting __version__ to _QlibConfig__version__bak
-            # Using  __version__bak instead of __version__
+            # Fallbacks if __version__bak is not present in the runtime qlib
+            backup = getattr(qlib, "__version__bak", getattr(qlib, "__version__", "0.0.0"))
+            qlib.__version__ = backup
+            # Using __version__bak when available to avoid name-mangling issues; otherwise use current version
 
     def get_kernels(self, freq: str):
         """get number of processors given frequency"""

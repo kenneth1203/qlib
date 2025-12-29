@@ -195,6 +195,8 @@ def score_instrument(df: pd.DataFrame, params: Dict) -> Tuple[int, int, Dict]:
     ma120 = c.rolling(params["ma_120"]).mean()
     macd_line, macd_sig, _ = macd(c, params["macd_fast"], params["macd_slow"], params["macd_signal"])
     rsi_val = rsi(c, params["rsi_window"])
+    rsi_neutral_low = float(params.get("rsi_neutral_low", 40))
+    rsi_neutral_high = float(params.get("rsi_neutral_high", 60))
     roc_val = roc(c, params["roc_window"])
     mom_val = momentum(c, params["mom_window"])
     vol_ma = v.rolling(params["vol_ma_window"]).mean()
@@ -212,6 +214,13 @@ def score_instrument(df: pd.DataFrame, params: Dict) -> Tuple[int, int, Dict]:
     don_up, don_dn = donchian(h, l, params["don_window"])
     zscore = (c - ma20) / (c.rolling(params["z_window"]).std(ddof=0).replace(0, np.nan))
     rsi_bull_div, rsi_bear_div = rsi_divergence(c, rsi_val, window=params["rsi_div_window"])
+
+    kdj_overbought = float(params.get("kdj_overbought", 80))
+    kdj_oversold = float(params.get("kdj_oversold", 20))
+    wpr_overbought = float(params.get("wpr_overbought", -20))
+    wpr_oversold = float(params.get("wpr_oversold", -80))
+    cci_overbought = float(params.get("cci_overbought", 100))
+    cci_oversold = float(params.get("cci_oversold", -100))
 
     rs_val = np.nan
     rs_window = params.get("rs_window", 60)
@@ -270,9 +279,12 @@ def score_instrument(df: pd.DataFrame, params: Dict) -> Tuple[int, int, Dict]:
     elif not allow_partial:
         add_bear(True, "MACD_zero_missing")
 
-    add_bull((rsi_val.iloc[-1] > 50), "RSI>50")
-    add_bear((rsi_val.iloc[-1] > 70), "RSI>70_overbought")
-    add_bull((rsi_val.iloc[-1] < 30), "RSI<30_oversold")
+    rsi_last = rsi_val.iloc[-1]
+    rsi_in_neutral = (rsi_last >= rsi_neutral_low) and (rsi_last <= rsi_neutral_high)
+    # Neutral band: 40–60 default. Mid-range does not contribute to bull/bear.
+    add_bull((rsi_last > rsi_neutral_high), f"RSI>{int(rsi_neutral_high)}")
+    add_bear((rsi_last > 70), "RSI>70_overbought")
+    add_bull((rsi_last < 30), "RSI<30_oversold")
     add_bull(rsi_bull_div, "RSI_bull_div")
     add_bear(rsi_bear_div, "RSI_bear_div")
 
@@ -301,10 +313,10 @@ def score_instrument(df: pd.DataFrame, params: Dict) -> Tuple[int, int, Dict]:
     add_bear((atr_change is not None and atr_change < 0), "ATR_falling")
     add_bear(pd.notna(atr_s.iloc[-1]) and pd.notna(atr_ma.iloc[-1]) and (atr_s.iloc[-1] < params["atr_squeeze_mult"] * atr_ma.iloc[-1]), "ATR_squeeze")
 
-    add_bear((k_val.iloc[-1] > 80), "K>80_overbought")
-    add_bull((k_val.iloc[-1] < 20), "K<20_oversold")
-    add_bear((wpr_val.iloc[-1] > -20), "W%R>-20_overbought")
-    add_bull((wpr_val.iloc[-1] < -80), "W%R<-80_oversold")
+    add_bear((k_val.iloc[-1] > kdj_overbought), f"K>{int(kdj_overbought)}_overbought")
+    add_bull((k_val.iloc[-1] < kdj_oversold), f"K<{int(kdj_oversold)}_oversold")
+    add_bear((wpr_val.iloc[-1] > wpr_overbought), f"W%R>{int(wpr_overbought)}_overbought")
+    add_bull((wpr_val.iloc[-1] < wpr_oversold), f"W%R<{int(wpr_oversold)}_oversold")
 
     if pd.notna(st_dir.iloc[-1]):
         add_bull((st_dir.iloc[-1] == 1), "Supertrend_up")
@@ -322,12 +334,12 @@ def score_instrument(df: pd.DataFrame, params: Dict) -> Tuple[int, int, Dict]:
         pass
 
     if pd.notna(adx_val.iloc[-1]):
+        # Treat weak trend as中性：只獎勵強趨勢，不懲罰弱趨勢
         add_bull(adx_val.iloc[-1] >= 25, "ADX_strong_trend")
-        add_bear(adx_val.iloc[-1] <= 20, "ADX_weak_trend")
 
     if pd.notna(cci_val.iloc[-1]):
-        add_bull(cci_val.iloc[-1] > 100, "CCI>100")
-        add_bear(cci_val.iloc[-1] < -100, "CCI<-100")
+        add_bull(cci_val.iloc[-1] > cci_overbought, f"CCI>{int(cci_overbought)}")
+        add_bear(cci_val.iloc[-1] < cci_oversold, f"CCI<{int(cci_oversold)}")
 
     if len(don_up) >= 2 and len(don_dn) >= 2 and pd.notna(don_up.iloc[-2]) and pd.notna(don_dn.iloc[-2]):
         add_bull(c.iloc[-1] > don_up.iloc[-2], "Donchian_breakout_up")
@@ -362,6 +374,7 @@ def score_instrument(df: pd.DataFrame, params: Dict) -> Tuple[int, int, Dict]:
         "don_dn": float(don_dn.iloc[-2]) if pd.notna(don_dn.iloc[-2]) else 0.0,
         "zscore": float(zscore.iloc[-1]) if pd.notna(zscore.iloc[-1]) else 0.0,
         "vwap": float(vwap.iloc[-1]) if pd.notna(vwap.iloc[-1]) else float("nan"),
+        "rsi_neutral": bool(rsi_in_neutral),
         "rsi_bull_div": bool(rsi_bull_div),
         "rsi_bear_div": bool(rsi_bear_div),
         "rs": float(rs_val) if pd.notna(rs_val) else float("nan"),

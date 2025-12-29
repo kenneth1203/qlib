@@ -49,15 +49,15 @@ def main(recorder_id, experiment_name, provider_uri, topk):
     # import the HK example dataset config
     try:
         # try normal import first
-        from qlib.tests import workflow_by_code_HK as hkmod  # type: ignore
+        from qlib.tests import T0_workflow_by_code_HK as hkmod  # type: ignore
     except Exception:
         # fallback: load module from the tests directory file path
         import importlib.util
         test_dir = os.path.dirname(__file__)
-        wk_path = os.path.join(test_dir, "workflow_by_code_HK.py")
+        wk_path = os.path.join(test_dir, "T0_workflow_by_code_HK.py")
         if not os.path.exists(wk_path):
-            raise RuntimeError(f"Cannot find workflow_by_code_HK.py at {wk_path}")
-        spec = importlib.util.spec_from_file_location("qlib.tests.workflow_by_code_HK", wk_path)
+            raise RuntimeError(f"Cannot find T0_workflow_by_code_HK.py at {wk_path}")
+        spec = importlib.util.spec_from_file_location("qlib.tests.T0_workflow_by_code_HK", wk_path)
         hkmod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(hkmod)  # type: ignore
 
@@ -100,7 +100,7 @@ def main(recorder_id, experiment_name, provider_uri, topk):
             pass
         liq_window = 20
         keep_insts, info = hkmod.compute_liquid_instruments(
-            liq_threshold=3_000_000,
+            liq_threshold=5_000_000,
             liq_window=liq_window,
             handler_end_time=hkw.get("end_time", None),
         )
@@ -321,7 +321,7 @@ if __name__ == "__main__":
     parser.add_argument("--recorder_id", default=None, help="recorder/run id (run id). If omitted, use latest run folder under ./mlruns")
     parser.add_argument("--experiment_name", default="workflow", help="experiment name")
     parser.add_argument("--provider_uri", default="~/.qlib/qlib_data/hk_data", help="qlib data dir")
-    parser.add_argument("--topk", type=int, default=50, help="print top-k instruments")
+    parser.add_argument("--topk", type=int, default=20, help="print top-k instruments")
     args = parser.parse_args()
     # If recorder_id not provided, pick latest run folder under ./mlruns
     if args.recorder_id is None:
