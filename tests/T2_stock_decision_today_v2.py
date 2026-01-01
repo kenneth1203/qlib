@@ -35,10 +35,14 @@ from qlib.workflow import R
 from qlib.data import D
 from qlib.utils.indicators import score_instrument, atr
 from qlib.utils.func import (
+    calendar_last_day,
+    compute_avg_dollar_volume,
+    fetch_base_close_vol,
+    fetch_ohlcv,
     next_trading_day_from_future,
+    resolve_chinese,
     to_qlib_inst,
     load_chinese_name_map,
-    resolve_chinese,
 )
 import matplotlib.pyplot as plt
 from qlib.utils.notify import TelegramNotifier, resolve_notify_params
@@ -63,15 +67,6 @@ except Exception:
         from model import Kronos, KronosTokenizer, KronosPredictor  # type: ignore
     except Exception:
         _KRONOS_AVAILABLE = False
-
-def calendar_last_day(today: datetime.date) -> str:
-    cal = D.calendar(
-        start_time=(today - datetime.timedelta(days=14)).strftime("%Y-%m-%d"),
-        end_time=today.strftime("%Y-%m-%d"),
-        freq="day",
-    )
-    return today.strftime("%Y-%m-%d") if len(cal) == 0 else cal[-1]
-
 
 def _dated_pred_path(recorder_id: str, target_day: str) -> Path:
     day_str = pd.to_datetime(target_day).strftime("%Y%m%d")
@@ -280,42 +275,6 @@ def compute_consecutive_selected(selected_today: List[str], selection_history: D
 
     return counts
 
-def fetch_ohlcv(instruments: List[str], start_dt: str, end_dt: str) -> pd.DataFrame:
-    # try to include $open, $vwap, and $amount if available for Kronos input
-    fields = ["$open", "$close", "$high", "$low", "$volume", "$vwap", "$amount"]
-    try:
-        df = D.features(instruments, fields, start_time=start_dt, end_time=end_dt, freq="day")
-        # some providers may lack $vwap; align columns safely
-        cols = list(df.columns)
-        rename = {}
-        # Expect at least 5: $open,$close,$high,$low,$volume,(optional)$vwap
-        if len(cols) >= 5:
-            # map first occurrences conservatively
-            # keep unknown columns as-is
-            # try to infer by name substring if provider returns different tokens
-            for c in cols:
-                lc = str(c).lower()
-                if "$open" in lc or lc.endswith("$open") or lc.endswith("open"):
-                    rename[c] = "$open"
-                elif "$close" in lc or lc.endswith("$close") or lc.endswith("close"):
-                    rename[c] = "$close"
-                elif "$high" in lc or lc.endswith("$high") or lc.endswith("high"):
-                    rename[c] = "$high"
-                elif "$low" in lc or lc.endswith("$low") or lc.endswith("low"):
-                    rename[c] = "$low"
-                elif "$volume" in lc or lc.endswith("$volume") or lc.endswith("volume"):
-                    rename[c] = "$volume"
-                elif "$vwap" in lc or lc.endswith("$vwap") or lc.endswith("vwap"):
-                    rename[c] = "$vwap"
-                elif "$amount" in lc or lc.endswith("$amount") or lc.endswith("amount"):
-                    rename[c] = "$amount"
-        df.columns = [rename.get(c, c) for c in cols]
-    except Exception:
-        df = D.features(instruments, ["$open", "$close", "$high", "$low", "$volume"], start_time=start_dt, end_time=end_dt, freq="day")
-        df.columns = ["$open", "$close", "$high", "$low", "$volume"]
-    return df
-
-
 def try_fetch_hsi(start_dt: str, end_dt: str) -> pd.DataFrame:
     """Fetch HSI OHLC via qlib if available, else fallback to yahooquery.
     Returns DataFrame with columns: $close,$high,$low indexed by datetime.
@@ -357,33 +316,6 @@ def try_fetch_hsi(start_dt: str, end_dt: str) -> pd.DataFrame:
     except Exception:
         pass
     return pd.DataFrame(columns=["$close", "$high", "$low"])
-
-
-def fetch_base_close_vol(instruments: List[str], start_dt: str, end_dt: str) -> pd.DataFrame:
-    try:
-        base = D.features(instruments, ["$close", "$volume"], start_time=start_dt, end_time=end_dt, freq="day")
-        base.columns = ["$close", "$volume"]
-        return base
-    except Exception:
-        return pd.DataFrame()
-
-
-def compute_avg_dollar_volume(base: pd.DataFrame, instruments: List[str], liq_window: int) -> Dict[str, float]:
-    if base.empty:
-        return {inst: 0.0 for inst in instruments}
-
-    def _tail_mean_dollar(df):
-        df2 = df.dropna()
-        if df2.empty:
-            return 0.0
-        dv = (df2["$close"] * df2["$volume"]).tail(liq_window)
-        return float(dv.mean()) if len(dv) > 0 else 0.0
-
-    try:
-        return base.groupby(level="instrument").apply(_tail_mean_dollar).to_dict()
-    except Exception:
-        return {inst: 0.0 for inst in instruments}
-
 
 def compute_market_regime(base: pd.DataFrame, start_dt: str, target_day: str):
     """Return dict with regime texts and metrics; never raises."""
@@ -899,11 +831,11 @@ def main(args, notifier: Optional[TelegramNotifier] = None):
         print(view[disp_cols])
 
     if notifier:
-        lines = [
+        header = [
             f"T2 decision for {msg_day}",
             f"recorder_id: {args.recorder_id}",
         ]
-        table_lines = []
+        table_lines: List[str] = []
         try:
             mobile_cols = ["instrument", "chinese_name", "final_score", "buy", "kronos_score", "model_score", "net_c", "streak_days"]
             v2 = view[mobile_cols].copy()
@@ -912,8 +844,8 @@ def main(args, notifier: Optional[TelegramNotifier] = None):
             v2["model_score"] = v2.get("model_score", "").astype(str)
             v2["net_c"] = v2.get("net_c", "").astype(str)
             widths = {c: max(len(str(c)), int(v2[c].map(lambda x: len(str(x))).max())) for c in mobile_cols}
-            header = " ".join([str(c).ljust(widths[c]) for c in mobile_cols])
-            table_lines.append(header)
+            header_line = " ".join([str(c).ljust(widths[c]) for c in mobile_cols])
+            table_lines.append(header_line)
             for _, row in v2.iterrows():
                 cells = [str(row[c]).ljust(widths[c]) for c in mobile_cols]
                 table_lines.append(" ".join(cells))
@@ -922,12 +854,12 @@ def main(args, notifier: Optional[TelegramNotifier] = None):
                 table_lines.append(view[disp_cols].to_string(index=False))
             except Exception:
                 pass
-        # If Markdown is enabled, wrap the table in a code block to avoid parsing issues
-        if isinstance(notifier, TelegramNotifier) and getattr(notifier, 'parse_mode', None):
-            payload_lines = lines + ["```"] + table_lines + ["```"]
-            notifier.send("\n".join(payload_lines))
+
+        if table_lines:
+            payload_lines = ["```"] + header + table_lines + ["```"]
         else:
-            notifier.send("\n".join(lines + table_lines))
+            payload_lines = header
+        notifier.send("\n".join(payload_lines))
 
 
 if __name__ == "__main__":
@@ -955,7 +887,6 @@ if __name__ == "__main__":
     parser.add_argument("--telegram_token", help="telegram bot token (optional)")
     parser.add_argument("--telegram_chat_id", help="telegram chat id (optional)")
     parser.add_argument("--notify_config", help="path to JSON config with telegram_token/chat_id")
-    parser.add_argument("--telegram_markdown", action="store_true", help="send Telegram using Markdown and wrap tables in code block")
     args = parser.parse_args()
     # If recorder_id not provided, pick latest run folder under ./mlruns
     if args.recorder_id is None:
@@ -981,5 +912,5 @@ if __name__ == "__main__":
             print("No recorder_id provided and no runs found in ./mlruns. Please supply --recorder_id")
             raise SystemExit(1)
     tok, chat = resolve_notify_params(args.telegram_token, args.telegram_chat_id, args.notify_config)
-    notifier = TelegramNotifier(tok, chat, parse_mode=("Markdown" if getattr(args, "telegram_markdown", False) else None))
+    notifier = TelegramNotifier(tok, chat, parse_mode="MarkdownV2")
     main(args, notifier)

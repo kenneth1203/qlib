@@ -11,6 +11,7 @@ from abc import ABC
 import multiprocessing
 from pathlib import Path
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 import fire
 import requests
@@ -24,6 +25,7 @@ import qlib
 from qlib.data import D
 from qlib.tests.data import GetData
 from qlib.utils import code_to_fname, fname_to_code, exists_qlib_data
+from qlib.utils.func import next_trading_day_from_future
 from qlib.constant import REG_CN as REGION_CN
 
 CUR_DIR = Path(__file__).resolve().parent
@@ -374,8 +376,8 @@ class YahooCollectorHK(YahooCollector, ABC):
                     df = _resp.reset_index()
                     #df["used_symbol_for_yahoo"] = cand
                     if interval.lower() == "1d" and "date" in df.columns:
-                        #df["date"] = df["date"].astype(str).str[:10]
-                        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+                        df["date"] = df["date"].astype(str).str[:10]
+                        #df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
                     return df
                 elif isinstance(_resp, dict):
                     _temp_data = _resp.get(cand, {})
@@ -1212,9 +1214,40 @@ class Run(BaseRun):
                 target_dir=qlib_data_1d_dir, interval=self.interval, region=self.region, exists_skip=exists_skip
             )
 
-        # start/end date
+        # start/end date using future calendar
         calendar_df = pd.read_csv(Path(qlib_data_1d_dir).joinpath("calendars/day.txt"))
-        trading_date = (pd.Timestamp(calendar_df.iloc[-1, 0]) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        last_trading_day = pd.Timestamp(calendar_df.iloc[-1, 0]).strftime("%Y-%m-%d")
+        trading_date = next_trading_day_from_future(qlib_data_1d_dir, last_trading_day)
+        if trading_date is None:
+            trading_date = (pd.Timestamp(last_trading_day) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        region_lower = self.region.lower()
+        tz_name = {
+            "cn": "Asia/Shanghai",
+            "us": "America/New_York",
+            "hk": "Asia/Hong_Kong",
+            "in": "Asia/Kolkata",
+            "br": "Brazil/East",
+        }.get(region_lower, "UTC")
+        try:
+            now_ts = datetime.datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            now_ts = datetime.datetime.now()
+        today = now_ts.date().strftime("%Y-%m-%d")
+        market_close_time = {
+            "cn": datetime.time(15, 5),
+            "hk": datetime.time(16, 15),
+            "us": datetime.time(16, 5),
+            "in": datetime.time(15, 35),
+            "br": datetime.time(17, 10),
+        }.get(region_lower, datetime.time(16, 0))
+        if trading_date != today:
+            logger.info(f"skip update: trading_date={trading_date} today={today}")
+            return
+        if now_ts.time() < market_close_time:
+            logger.info(
+                f"skip update: market not closed for region={region_lower} (now={now_ts.time()} < close={market_close_time})"
+            )
+            return
         print(f"trading_date: {trading_date}")
         if end_date is None:
             end_date = (pd.Timestamp(trading_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")

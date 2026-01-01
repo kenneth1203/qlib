@@ -11,11 +11,11 @@ from model import Kronos, KronosTokenizer, KronosPredictor
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Kronos HK 7-day forecast using qlib bin data")
-    parser.add_argument("--symbol", default="06168.HK", help="HK ticker, e.g. 00001.HK")
+    parser.add_argument("--symbol", default="06616.HK", help="HK ticker, e.g. 00001.HK")
     parser.add_argument("--provider_uri", default="~/.qlib/qlib_data/hk_data", help="qlib bin data path")
     parser.add_argument("--lookback", type=int, default=300, help="history days fed into Kronos")
     parser.add_argument("--min_history", type=int, default=60, help="minimum clean history required before fallback")
-    parser.add_argument("--pred_len", type=int, default=120, help="number of trading days to draw for prediction line")
+    parser.add_argument("--pred_len", type=int, default=14, help="number of trading days to draw for prediction line")
     parser.add_argument("--device", default="cuda:0", help="Torch device for inference")
     parser.add_argument("--max_context", type=int, default=512, help="Max context tokens for Kronos")
     parser.add_argument("--fill_missing", action="store_true", help="forward/backward fill missing OHLCV before dropping")
@@ -126,7 +126,7 @@ def main():
     x_timestamp = x_df.index.to_series()
     # Build prediction timeline starting from the calendar's last trading day
     cal = D.calendar(start_time=None, end_time=None, freq="day")
-    last_cal_day = pd.to_datetime(cal[-1])
+    last_cal_day = pd.to_datetime(cal[-1]) + pd.Timedelta(days=1)
     y_bdays = pd.bdate_range(start=last_cal_day, periods=args.pred_len, freq="B")
     y_timestamp = pd.Series(y_bdays)
 

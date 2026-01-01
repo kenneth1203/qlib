@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import pandas as pd
-from qlib.qlib.utils.notify import TelegramNotifier, resolve_notify_params
+from qlib.utils.notify import TelegramNotifier, resolve_notify_params
 
 try:
     from futu import (

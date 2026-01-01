@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Shared utility functions for qlib scripts."""
 import os
+import datetime
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -17,6 +18,15 @@ def to_qlib_inst(x: str) -> str:
     if s.isdigit():
         s = s.zfill(5)
     return s.upper() + ".HK"
+
+
+def calendar_last_day(today: datetime.date) -> str:
+    cal = D.calendar(
+        start_time=(today - datetime.timedelta(days=14)).strftime("%Y-%m-%d"),
+        end_time=today.strftime("%Y-%m-%d"),
+        freq="day",
+    )
+    return today.strftime("%Y-%m-%d") if len(cal) == 0 else cal[-1]
 
 
 def load_chinese_name_map() -> Dict[str, str]:
@@ -95,6 +105,66 @@ def resolve_chinese(inst_code: str, chinese_map: Dict[str, str]) -> str:
     return ""
 
 
+def fetch_ohlcv(instruments: List[str], start_dt: str, end_dt: str):
+    # try to include $open, $vwap, and $amount if available for Kronos input
+    fields = ["$open", "$close", "$high", "$low", "$volume", "$vwap", "$amount"]
+    try:
+        df = D.features(instruments, fields, start_time=start_dt, end_time=end_dt, freq="day")
+        # some providers may lack $vwap; align columns safely
+        cols = list(df.columns)
+        rename = {}
+        # Expect at least 5: $open,$close,$high,$low,$volume,(optional)$vwap
+        if len(cols) >= 5:
+            # map first occurrences conservatively
+            for c in cols:
+                lc = str(c).lower()
+                if "$open" in lc or lc.endswith("$open") or lc.endswith("open"):
+                    rename[c] = "$open"
+                elif "$close" in lc or lc.endswith("$close") or lc.endswith("close"):
+                    rename[c] = "$close"
+                elif "$high" in lc or lc.endswith("$high") or lc.endswith("high"):
+                    rename[c] = "$high"
+                elif "$low" in lc or lc.endswith("$low") or lc.endswith("low"):
+                    rename[c] = "$low"
+                elif "$volume" in lc or lc.endswith("$volume") or lc.endswith("volume"):
+                    rename[c] = "$volume"
+                elif "$vwap" in lc or lc.endswith("$vwap") or lc.endswith("vwap"):
+                    rename[c] = "$vwap"
+                elif "$amount" in lc or lc.endswith("$amount") or lc.endswith("amount"):
+                    rename[c] = "$amount"
+        df.columns = [rename.get(c, c) for c in cols]
+    except Exception:
+        df = D.features(instruments, ["$open", "$close", "$high", "$low", "$volume"], start_time=start_dt, end_time=end_dt, freq="day")
+        df.columns = ["$open", "$close", "$high", "$low", "$volume"]
+    return df
+
+
+def fetch_base_close_vol(instruments: List[str], start_dt: str, end_dt: str):
+    try:
+        base = D.features(instruments, ["$close", "$volume"], start_time=start_dt, end_time=end_dt, freq="day")
+        base.columns = ["$close", "$volume"]
+        return base
+    except Exception:
+        return pd.DataFrame()
+
+
+def compute_avg_dollar_volume(base, instruments: List[str], liq_window: int) -> Dict[str, float]:
+    if base is None or getattr(base, "empty", False):
+        return {inst: 0.0 for inst in instruments}
+
+    def _tail_mean_dollar(df):
+        df2 = df.dropna()
+        if df2.empty:
+            return 0.0
+        dv = (df2["$close"] * df2["$volume"]).tail(liq_window)
+        return float(dv.mean()) if len(dv) > 0 else 0.0
+
+    try:
+        return base.groupby(level="instrument").apply(_tail_mean_dollar).to_dict()
+    except Exception:
+        return {inst: 0.0 for inst in instruments}
+
+
 def next_trading_day_from_future(provider_uri: str, current_day: str) -> Optional[str]:
     """Return the next trading day after current_day using day_future.txt; fallback to D.calendar."""
     try:
@@ -142,7 +212,11 @@ def next_trading_day_from_future(provider_uri: str, current_day: str) -> Optiona
 
 __all__ = [
     "to_qlib_inst",
+    "calendar_last_day",
     "load_chinese_name_map",
     "resolve_chinese",
+    "fetch_ohlcv",
+    "fetch_base_close_vol",
+    "compute_avg_dollar_volume",
     "next_trading_day_from_future",
 ]

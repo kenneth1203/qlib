@@ -21,7 +21,13 @@ from qlib.constant import REG_HK
 from wcwidth import wcswidth
 
 from qlib.utils.notify import TelegramNotifier, resolve_notify_params
-from qlib.utils.func import to_qlib_inst
+from qlib.utils.func import (
+    to_qlib_inst,
+    load_chinese_name_map,
+    resolve_chinese,
+    calendar_last_day,
+    next_trading_day_from_future,
+)
 
 
 def _disp_width(x):
@@ -47,7 +53,7 @@ def _pad_left(s, width):
     return " " * (width - cur) + s
 
 
-def main(recorder_id, experiment_name, provider_uri, topk, notifier: Optional[TelegramNotifier] = None):
+def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120, notifier: Optional[TelegramNotifier] = None):
     provider_uri = os.path.expanduser(provider_uri)
     qlib.init(provider_uri=provider_uri, region=REG_HK)
 
@@ -84,12 +90,9 @@ def main(recorder_id, experiment_name, provider_uri, topk, notifier: Optional[Te
     from qlib.data import D
 
     today_dt = datetime.date.today()
-    cal = D.calendar(start_time=(today_dt - datetime.timedelta(days=14)).strftime("%Y-%m-%d"),
-                     end_time=today_dt.strftime("%Y-%m-%d"), freq="day")
-    if len(cal) == 0:
-        target_day = today_dt.strftime("%Y-%m-%d")
-    else:
-        target_day = cal[-1]
+    target_day = calendar_last_day(today_dt)
+
+    msg_day = next_trading_day_from_future(provider_uri, target_day) or target_day
 
     print("target_day (from qlib calendar):", target_day)
 
@@ -113,6 +116,50 @@ def main(recorder_id, experiment_name, provider_uri, topk, notifier: Optional[Te
         print("Sample kept instruments:", info["sample"])
         if len(keep_insts) > 0:
             hkw["instruments"] = keep_insts
+
+        # New listing filter after liquidity filter, before handler uses instruments
+        if min_listing_days and min_listing_days > 0:
+            insts = list(hkw.get("instruments", []))
+            if insts:
+                try:
+                    import pandas as pd
+
+                    listing_df = D.features(
+                        insts,
+                        ["$close"],
+                        start_time="2005-01-01",
+                        end_time=target_day,
+                        freq="day",
+                        disk_cache=True,
+                    )
+                    listed_days_map = {}
+                    if isinstance(listing_df, pd.DataFrame):
+                        close_s = listing_df[listing_df.columns[0]]
+                        if "instrument" in close_s.index.names:
+                            listed_days_map = (
+                                close_s.groupby(level="instrument")
+                                .apply(lambda s: int(s.dropna().shape[0]))
+                                .to_dict()
+                            )
+                    filtered = []
+                    filtered_out = []
+                    for inst in insts:
+                        days = int(listed_days_map.get(inst, 0))
+                        if days >= min_listing_days:
+                            filtered.append(inst)
+                        else:
+                            filtered_out.append((inst, days))
+                    hkw["instruments"] = filtered
+                    kept = len(filtered)
+                    if filtered_out:
+                        sample = ", ".join([f"{i}({d})" for i, d in filtered_out[:5]])
+                        print(
+                            f"Listing-day filter >= {min_listing_days}: kept {kept} / {len(insts)}; dropped sample: {sample}"
+                        )
+                    else:
+                        print(f"Listing-day filter >= {min_listing_days}: kept {kept} / {len(insts)}")
+                except Exception as e:
+                    print("Listing-day filter skipped due to error:", e)
     except Exception as e:
         print("Liquidity filter for predict failed:", e)
     
@@ -209,62 +256,34 @@ def main(recorder_id, experiment_name, provider_uri, topk, notifier: Optional[Te
                         ss = ss.droplevel([n for i, n in enumerate(ss.index.names) if i != inst_level])
             top = ss.sort_values(ascending=False).head(max(topk, 500))
 
-            # --- Select top-k (liquidity pre-filter already applied via handler) ---
+            # --- Select top-k (liquidity + listing pre-filters already applied via handler) ---
             cand_insts = [to_qlib_inst(i) for i in top.index]
             selected = cand_insts[:topk]
 
-            # Load Chinese name mapping (optional display)
-            mapping = {}
-            cand_paths = [
-                r"C:\\Users\\kennethlao\\.qlib\\qlib_data\\hk_data\\boardlot\\chinese_name.txt",
-                os.path.join(os.path.expanduser("~"), ".qlib", "qlib_data", "hk_data", "boardlot", "chinese_name.txt"),
-            ]
-            lines = []
-            for p in cand_paths:
-                if os.path.exists(p):
-                    try:
-                        with open(p, "r", encoding="utf-8") as fh:
-                            lines = fh.readlines()
-                    except Exception:
-                        try:
-                            with open(p, "r", encoding="gb18030") as fh:
-                                lines = fh.readlines()
-                        except Exception:
-                            lines = []
-                    break
-
-            for ln in lines:
-                parts = ln.strip().split()
-                if len(parts) >= 2:
-                    key = parts[0]
-                    name = " ".join(parts[1:])
-                    k = key.lower()
-                    if k.startswith("hk."):
-                        k = k.split(".", 1)[1] + ".hk"
-                    elif "." not in k and k.isdigit():
-                        k = k.zfill(5) + ".hk"
-                    mapping[k] = name
+            mapping = load_chinese_name_map()
 
             # Print selected top instruments with Chinese names and last-day volume
             score_df = pd.DataFrame({"score": list(top.values)}, index=cand_insts)
             score_df.index.name = "instrument"
 
+            vol_map = {}
             # compute avg dollar volume over last `liq_window` trading bars for selected instruments
             try:
-                start_dt = (pd.to_datetime(target_day) - pd.Timedelta(days=liq_window * 3)).strftime("%Y-%m-%d")
-                base = D.features(selected, ["$close", "$volume"], start_time=start_dt, end_time=target_day, freq="day")
-                base.columns = ["$close", "$volume"]
+                if selected:
+                    start_dt = (pd.to_datetime(target_day) - pd.Timedelta(days=liq_window * 3)).strftime("%Y-%m-%d")
+                    base = D.features(selected, ["$close", "$volume"], start_time=start_dt, end_time=target_day, freq="day")
+                    base.columns = ["$close", "$volume"]
 
-                def _tail_mean_dollar(df):
-                    df2 = df.dropna()
-                    if df2.empty:
-                        return 0.0
-                    dv = (df2["$close"] * df2["$volume"]).tail(liq_window)
-                    return float(dv.mean()) if len(dv) > 0 else 0.0
+                    def _tail_mean_dollar(df):
+                        df2 = df.dropna()
+                        if df2.empty:
+                            return 0.0
+                        dv = (df2["$close"] * df2["$volume"]).tail(liq_window)
+                        return float(dv.mean()) if len(dv) > 0 else 0.0
 
-                vol_map = (
-                    base.groupby(level="instrument").apply(_tail_mean_dollar).to_dict()
-                )
+                    vol_map = (
+                        base.groupby(level="instrument").apply(_tail_mean_dollar).to_dict()
+                    )
             except Exception:
                 vol_map = {}
 
@@ -273,7 +292,7 @@ def main(recorder_id, experiment_name, provider_uri, topk, notifier: Optional[Te
             for inst in selected:
                 score = float(score_df.loc[inst, "score"]) if inst in score_df.index else 0.0
                 mk = inst.split(".", 1)[0].zfill(5) + ".hk"
-                name = mapping.get(mk, "")
+                name = resolve_chinese(inst, mapping)
                 avg_dollar = int(round(vol_map.get(inst, 0)))
                 rows.append({"id": mk, "name": name, "score": score, "avg_dollar": avg_dollar})
 
@@ -328,15 +347,11 @@ def main(recorder_id, experiment_name, provider_uri, topk, notifier: Optional[Te
         table_lines = []
         if 'lines' in locals():
             table_lines = lines
-        notifier.send(
-            "\n".join(
-                [
-                    f"T1 selection for {target_day}",
-                    f"recorder_id: {recorder_id}",
-                ]
-                + table_lines
-            )
-        )
+        if table_lines:
+            payload_lines = ["```", f"T1 selection for {msg_day}", f"recorder_id: {recorder_id}"] + table_lines + ["```"]
+        else:
+            payload_lines = [f"T1 selection for {msg_day}", f"recorder_id: {recorder_id}"]
+        notifier.send("\n".join(payload_lines))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -344,6 +359,7 @@ if __name__ == "__main__":
     parser.add_argument("--experiment_name", default="workflow", help="experiment name")
     parser.add_argument("--provider_uri", default="~/.qlib/qlib_data/hk_data", help="qlib data dir")
     parser.add_argument("--topk", type=int, default=20, help="print top-k instruments")
+    parser.add_argument("--min_listing_days", type=int, default=120, help="minimum trading days since listing; set 0 to disable filter")
     parser.add_argument("--telegram_token", help="telegram bot token (optional)")
     parser.add_argument("--telegram_chat_id", help="telegram chat id (optional)")
     parser.add_argument("--notify_config", help="path to JSON config with telegram_token/chat_id")
@@ -372,5 +388,5 @@ if __name__ == "__main__":
             print("No recorder_id provided and no runs found in ./mlruns. Please supply --recorder_id")
             raise SystemExit(1)
     tok, chat = resolve_notify_params(args.telegram_token, args.telegram_chat_id, args.notify_config)
-    notifier = TelegramNotifier(tok, chat)
-    main(args.recorder_id, args.experiment_name, args.provider_uri, args.topk, notifier)
+    notifier = TelegramNotifier(tok, chat, parse_mode="MarkdownV2")
+    main(args.recorder_id, args.experiment_name, args.provider_uri, args.topk, args.min_listing_days, notifier)
