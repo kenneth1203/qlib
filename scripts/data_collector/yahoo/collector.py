@@ -1214,12 +1214,13 @@ class Run(BaseRun):
                 target_dir=qlib_data_1d_dir, interval=self.interval, region=self.region, exists_skip=exists_skip
             )
 
-        # start/end date using future calendar
+        # start/end date using future calendar and robust catch-up logic
         calendar_df = pd.read_csv(Path(qlib_data_1d_dir).joinpath("calendars/day.txt"))
         last_trading_day = pd.Timestamp(calendar_df.iloc[-1, 0]).strftime("%Y-%m-%d")
-        trading_date = next_trading_day_from_future(qlib_data_1d_dir, last_trading_day)
-        if trading_date is None:
-            trading_date = (pd.Timestamp(last_trading_day) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        next_trading_day = next_trading_day_from_future(qlib_data_1d_dir, last_trading_day)
+        if next_trading_day is None:
+            next_trading_day = (pd.Timestamp(last_trading_day) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
         region_lower = self.region.lower()
         tz_name = {
             "cn": "Asia/Shanghai",
@@ -1240,17 +1241,28 @@ class Run(BaseRun):
             "in": datetime.time(15, 35),
             "br": datetime.time(17, 10),
         }.get(region_lower, datetime.time(16, 0))
-        if trading_date != today:
-            logger.info(f"skip update: trading_date={trading_date} today={today}")
+
+        if last_trading_day == today:
+            logger.info(f"skip update: data already up to today (last_trading_day={last_trading_day})")
             return
-        if now_ts.time() < market_close_time:
+        if today < next_trading_day:
+            logger.info(
+                f"skip update: today {today} is before next trading day {next_trading_day}; no new trading day yet"
+            )
+            return
+        if today == next_trading_day and now_ts.time() < market_close_time:
             logger.info(
                 f"skip update: market not closed for region={region_lower} (now={now_ts.time()} < close={market_close_time})"
             )
             return
-        print(f"trading_date: {trading_date}")
+
+        trading_date = next_trading_day
         if end_date is None:
-            end_date = (pd.Timestamp(trading_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            if today > next_trading_day:
+                end_date = (pd.Timestamp(today) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            else:
+                end_date = (pd.Timestamp(trading_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        print(f"trading_date: {trading_date}")
         print(f"end_date: {end_date}")
         # download data from yahoo (can be skipped via flag)
         # NOTE: when downloading data from YahooFinance, max_workers is recommended to be 1

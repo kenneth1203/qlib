@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+"""
+LLM-assisted stock advice generator via OpenRouter.
+
+For a given HK stock code, this script gathers:
+- 1y OHLCV from qlib
+- cached company fundamentals/news from ~/.qlib/qlib_data/hk_data/news/{code}.json
+- today's trending news buckets in the same folder
+- decision scores from a decision_YYYYMMDD_<recorder>.csv row
+
+It then prompts a multi-role analyst panel (technical, fundamental, news, bull vs bear debate,
+manager decision, final trading advisor) through OpenRouter and optionally sends the summary via Telegram.
+"""
+
+import argparse
+import json
+import os
+import sys
+import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+import requests
+
+import qlib
+from qlib.constant import REG_HK
+from qlib.data import D
+from qlib.utils.func import to_qlib_inst
+from qlib.utils.notify import TelegramNotifier, resolve_notify_params, load_notify_config
+
+
+OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+TRENDING_FILES = ["finance_today.json", "media_today.json", "social_today.json", "tech_today.json"]
+STAGE_ORDER = ["technical", "fundamental", "news", "social", "bull", "bear", "manager", "trade"]
+
+
+def _cache_path(cache_dir: Path, code: str, stage: str, model: str) -> Path:
+	cache_dir.mkdir(parents=True, exist_ok=True)
+	safe_code = code.replace("/", "_").replace("\\", "_")
+	safe_stage = stage.replace("/", "_")
+	safe_model = model.replace("/", "_").replace(":", "_")
+	return cache_dir / f"{safe_code}__{safe_stage}__{safe_model}.txt"
+
+
+def load_stage_cache(cache_dir: Path, code: str, stage: str, model: str) -> Optional[str]:
+	path = _cache_path(cache_dir, code, stage, model)
+	if path.exists():
+		print(f"[cache] hit stage={stage} path={path}")
+		try:
+			return path.read_text(encoding="utf-8")
+		except Exception:
+			print(f"[cache] read failed stage={stage} path={path}")
+			return None
+	return None
+
+
+def save_stage_cache(cache_dir: Path, code: str, stage: str, model: str, text: str) -> None:
+	path = _cache_path(cache_dir, code, stage, model)
+	try:
+		path.write_text(str(text), encoding="utf-8")
+		print(f"[cache] saved stage={stage} path={path}")
+	except Exception:
+		print(f"[cache] save failed stage={stage} path={path}")
+		pass
+
+
+def _read_json(path: Path) -> Any:
+	if not path.exists():
+		return None
+	try:
+		return json.loads(path.read_text(encoding="utf-8"))
+	except Exception:
+		return None
+
+
+def _select_instrument(row_inst: str) -> str:
+	try:
+		return to_qlib_inst(row_inst)
+	except Exception:
+		return str(row_inst)
+
+
+def load_decision_row(decision_path: Path, code: str) -> Dict[str, Any]:
+	if not decision_path.exists():
+		raise FileNotFoundError(f"Decision file missing: {decision_path}")
+	df = pd.read_csv(decision_path)
+	df.columns = [c.strip() for c in df.columns]
+	target = to_qlib_inst(code)
+	df["_inst"] = df.iloc[:, 0].map(_select_instrument)
+	row = df.loc[df["_inst"] == target]
+	if row.empty:
+		# try without suffix
+		bare = target.replace(".HK", "")
+		row = df[df["_inst"].str.replace(".HK", "", regex=False) == bare]
+	if row.empty:
+		raise ValueError(f"Instrument {code} not found in {decision_path}")
+	print(f"[info] loaded decision row for {target} from {decision_path}")
+	return row.iloc[0].to_dict()
+
+
+def load_company_news(news_dir: Path, code: str) -> Dict[str, Any]:
+	primary = _read_json(news_dir / f"{code}.json") or {}
+	trending: Dict[str, Any] = {}
+	for fname in TRENDING_FILES:
+		trending[fname] = _read_json(news_dir / fname) or []
+	return {"primary": primary, "trending": trending}
+
+
+def summarize_prices(code: str, provider_uri: str, lookback_days: int = 365) -> Dict[str, Any]:
+	qlib.init(provider_uri=os.path.expanduser(provider_uri), region=REG_HK)
+	print(f"[info] qlib initialized provider={provider_uri} region=HK")
+	end_dt = datetime.date.today()
+	start_dt = end_dt - datetime.timedelta(days=lookback_days)
+	inst = to_qlib_inst(code)
+	try:
+		df = D.features([inst], ["$open", "$high", "$low", "$close", "$volume"], start_time=str(start_dt), end_time=str(end_dt), freq="day")
+	except Exception as e:
+		raise RuntimeError(f"Failed to fetch qlib data for {inst}: {e}")
+	if df.empty:
+		raise RuntimeError(f"No qlib data for {inst}")
+	print(f"[info] fetched ohlcv rows={len(df)} from {start_dt} to {end_dt}")
+	# qlib may return MultiIndex columns like (instrument, feature).
+	# Normalize to a DataFrame with exactly the OHLCV columns we need.
+	orig_cols = list(df.columns)
+	# attempt to find feature names in last level
+	flat_cols = []
+	for c in orig_cols:
+		if isinstance(c, tuple):
+			flat_cols.append(c[-1])
+		else:
+			flat_cols.append(c)
+	# candidate feature names we expect (with and without $)
+	need = ["$open", "$high", "$low", "$close", "$volume"]
+	alt_need = [n.lstrip("$") for n in need]
+	col_map = {}
+	for want in need:
+		if want in flat_cols:
+			idx = flat_cols.index(want)
+			col_map[want] = orig_cols[idx]
+		else:
+			# try without $
+			w2 = want.lstrip("$")
+			if w2 in flat_cols:
+				idx = flat_cols.index(w2)
+				col_map[want] = orig_cols[idx]
+	# If we didn't find all, try fuzzy matching by suffix
+	for want in need:
+		if want not in col_map:
+			for i, fc in enumerate(flat_cols):
+				if isinstance(fc, str) and fc.lower().endswith(want.lstrip("$").lower()):
+					col_map[want] = orig_cols[i]
+					break
+	# Ensure we have mapping for all required columns
+	if len(col_map) < len(need):
+		raise RuntimeError(f"Could not locate all OHLCV columns in qlib result. cols={flat_cols}")
+	# select and rename
+	df2 = df.loc[:, [col_map[n] for n in need]].copy()
+	df2.columns = ["open", "high", "low", "close", "volume"]
+	df = df2.reset_index().set_index("datetime").sort_index()
+	close = df["close"].astype(float)
+	stats = {
+		"last_date": close.index.max().strftime("%Y-%m-%d"),
+		"last_close": float(close.iloc[-1]),
+		"return_5d": float((close.iloc[-1] / close.tail(5).iloc[0]) - 1.0) if len(close) >= 5 else np.nan,
+		"return_20d": float((close.iloc[-1] / close.tail(20).iloc[0]) - 1.0) if len(close) >= 20 else np.nan,
+		"return_1y": float((close.iloc[-1] / close.iloc[0]) - 1.0),
+		"volatility_20d": float(close.pct_change().tail(20).std()),
+	}
+	ma_short = close.rolling(20).mean()
+	ma_mid = close.rolling(60).mean()
+	ma_long = close.rolling(120).mean()
+	stats["ma_trend"] = {
+		"ma20": float(ma_short.iloc[-1]) if not np.isnan(ma_short.iloc[-1]) else None,
+		"ma60": float(ma_mid.iloc[-1]) if not np.isnan(ma_mid.iloc[-1]) else None,
+		"ma120": float(ma_long.iloc[-1]) if not np.isnan(ma_long.iloc[-1]) else None,
+		"ma20_gt_ma60": bool(ma_short.iloc[-1] > ma_mid.iloc[-1]) if not np.isnan(ma_short.iloc[-1]) and not np.isnan(ma_mid.iloc[-1]) else None,
+		"ma60_gt_ma120": bool(ma_mid.iloc[-1] > ma_long.iloc[-1]) if not np.isnan(ma_mid.iloc[-1]) and not np.isnan(ma_long.iloc[-1]) else None,
+	}
+	tail = df.tail(60).copy()
+	tail.index = tail.index.strftime("%Y-%m-%d")
+	return {"stats": stats, "recent_ohlcv": tail}
+
+
+def _pick_finance_snippets(company_blob: Dict[str, Any]) -> Dict[str, Any]:
+	if not company_blob:
+		return {}
+	company = company_blob.get("company", {}) if isinstance(company_blob.get("company"), dict) else {}
+	profile = company.get("profile", {}) if isinstance(company.get("profile"), dict) else {}
+	review = company.get("review", "") if isinstance(company, dict) else ""
+	outlook = company.get("outlook", "") if isinstance(company, dict) else ""
+	finance = company_blob.get("finance", {}) if isinstance(company_blob.get("finance"), dict) else {}
+	return {
+		"profile": profile,
+		"review": review,
+		"outlook": outlook,
+		"finance_standard": finance.get("finance_standard", []),
+		"finance_status": finance.get("finance_status", []),
+		"balance_sheet": finance.get("balance_sheet", []),
+		"cash_flow": finance.get("cash_flow", []),
+	}
+
+
+def _format_decision_context(decision_row: Dict[str, Any]) -> str:
+	keys = [
+		"model_score",
+		"kronos_score",
+		"bull_score",
+		"bear_score",
+		"net_score",
+		"net_c",
+		"final_score",
+		"streak_days",
+		"avg_dollar_vol",
+		"buy",
+	]
+	parts = []
+	for k in keys:
+		if k in decision_row:
+			parts.append(f"{k}={decision_row.get(k)}")
+	return "; ".join(parts)
+
+
+def _recent_ohlcv_lines(price_info: Dict[str, Any], days: int = 10) -> List[str]:
+	recent = price_info.get("recent_ohlcv")
+	if not isinstance(recent, pd.DataFrame):
+		return []
+	tail = recent.tail(days)
+	lines: List[str] = []
+	for idx, row in tail.iterrows():
+		lines.append(
+			f"{idx}: o={row['open']:.2f} h={row['high']:.2f} l={row['low']:.2f} c={row['close']:.2f} v={int(row['volume'])}"
+		)
+	return lines
+
+
+def build_technical_messages(code: str, decision_row: Dict[str, Any], price_info: Dict[str, Any]) -> List[Dict[str, str]]:
+	stats = price_info.get("stats", {})
+	ma = stats.get("ma_trend", {})
+	scoring = (
+		"final_score = (w_model * model_score + w_net * net_c) * kronos_score * 100; "
+		"kronos_score = 1/(1+exp(-alpha*r)), alpha=5; net_c = 1/(1+exp(-net_score/3)), net_score=bull_score-bear_score; "
+		"streak_days=qlib預測TopK連續出現天數; avg_dollar_vol=平均成交金額; buy=True 表示通過基本篩選。"
+	)
+	price_summary = (
+		f"最後交易日: {stats.get('last_date')} 收盤: {stats.get('last_close'):.4f}"
+		f" | 5日: {stats.get('return_5d', np.nan):.2%} 20日: {stats.get('return_20d', np.nan):.2%}"
+		f" | 1年: {stats.get('return_1y', np.nan):.2%} 波動率20日: {stats.get('volatility_20d', np.nan):.2%}"
+		f" | MA20={ma.get('ma20')} MA60={ma.get('ma60')} MA120={ma.get('ma120')}"
+		f" | MA20>MA60={ma.get('ma20_gt_ma60')} MA60>MA120={ma.get('ma60_gt_ma120')}"
+	)
+	recent_lines = _recent_ohlcv_lines(price_info, days=30)
+	msg = [
+		{
+			"role": "system",
+			"content": "你是股票市場技術分析師，聚焦K線形態、趨勢、支撐阻力、動能、量價結構、風險點，並給出買賣時機初步判斷。",
+		},
+		{"role": "system", "content": scoring},
+		{
+			"role": "user",
+			"content": "\n".join(
+				[
+					f"股票代號: {code}",
+					f"決策數據: {_format_decision_context(decision_row)}",
+					f"價格摘要: {price_summary}",
+					"最近12日OHLCV:" if recent_lines else "",
+					"\n".join(recent_lines),
+					"請輸出 JSON: {technical_report, signals, risk}. signals 包含買/賣/觀望和理由。",
+				]
+			),
+		},
+	]
+	print(f"[debug] technical messages: {msg}")
+	return msg
+
+def build_fundamental_messages(code: str, decision_row: Dict[str, Any], finance_snip: Dict[str, Any]) -> List[Dict[str, str]]:
+	msg = [
+		{
+			"role": "system",
+			"content": "你是股票基本面分析師，聚焦盈利能力、成長、估值、財務風險與催化，給出估值區間與結論。",
+		},
+		{
+			"role": "user",
+			"content": "\n".join(
+				[
+					f"股票代號: {code}",
+					f"決策數據: {_format_decision_context(decision_row)}",
+					f"公司概況: {finance_snip.get('profile', {})}",
+					f"管理層回顧(review): {finance_snip.get('review', '')}",
+					f"展望(outlook): {finance_snip.get('outlook', '')}",
+					f"財務指標(完整 finance_standard): {finance_snip.get('finance_standard', [])}",
+					f"財務狀況(finance_status): {finance_snip.get('finance_status', [])}",
+					f"資產負債表(balance_sheet): {finance_snip.get('balance_sheet', [])}",
+					f"現金流量表(cash_flow): {finance_snip.get('cash_flow', [])}",
+					"請輸出 JSON: {fundamental_report, valuation_view, risk}. 務必先總結重點，再給結論。",
+				]
+			),
+		},
+	]
+	print(f"[debug] fundamental messages: {msg}")
+	return msg
+
+
+def _format_trending_items(items: Any) -> List[str]:
+	lines: List[str] = []
+	if isinstance(items, list) and items:
+		for it in items:
+			if isinstance(it, dict):
+				title = it.get("title") or it.get("headline") or str(it)
+				time = it.get("time") or it.get("date") or ""
+				lines.append(f"{time}: {title}" if time else str(title))
+			else:
+				lines.append(str(it))
+	return lines
+
+
+def build_news_messages(code: str, news_blob: Dict[str, Any]) -> List[Dict[str, str]]:
+	primary_news = news_blob.get("primary", {})
+	company_news = primary_news.get("news", []) if isinstance(primary_news, dict) else []
+	news_lines = [f"{n.get('time','')}: {n.get('title','')}" for n in company_news]
+	trending_all = news_blob.get("trending", {}) or {}
+	finance_lines = _format_trending_items(trending_all.get("finance_today.json")) if isinstance(trending_all, dict) else []
+	msg = [
+		{
+			"role": "system",
+			"content": "你是新聞與舆情分析師，判斷新聞對股價的潛在正負影響、情緒強度與持續性，給出催化/風險清單。",
+		},
+		{
+			"role": "user",
+			"content": "\n".join(
+				[
+					f"股票代號: {code}",
+					"全部公司新聞:" if news_lines else "公司新聞: 無", "\n".join(news_lines),
+					"finance_today 全部新聞:" if finance_lines else "finance_today: 無", "\n".join(finance_lines),
+					"請輸出 JSON: {news_impact, sentiment, catalysts, risks}. sentiment 需標示偏多/偏空與強度。",
+				]
+			),
+		},
+	]
+	print(f"[debug] news messages: {msg}")
+	return msg
+
+
+def build_social_messages(code: str, news_blob: Dict[str, Any], finance_snip: Dict[str, Any]) -> List[Dict[str, str]]:
+	trending_all = news_blob.get("trending", {}) or {}
+	media_lines = _format_trending_items(trending_all.get("media_today.json")) if isinstance(trending_all, dict) else []
+	social_lines = _format_trending_items(trending_all.get("social_today.json")) if isinstance(trending_all, dict) else []
+	tech_lines = _format_trending_items(trending_all.get("tech_today.json")) if isinstance(trending_all, dict) else []
+	company_brief = finance_snip.get("profile", {}) if isinstance(finance_snip, dict) else {}
+	brief_line = f"公司簡介: {company_brief}" if company_brief else "公司簡介: N/A"
+	msg = [
+		{
+			"role": "system",
+			"content": "你是社媒與輿情分析師，處理當日媒體/社交/科技熱點。請先判斷每則是否與該公司業務或催化相關，標註關聯度與理由；對無關內容要明確標示無關。然後評估整體熱度傳播、情緒方向與1-10天內對股價的可能影響。",
+		},
+		{
+			"role": "user",
+			"content": "\n".join(
+				[
+					f"股票代號: {code}",
+					brief_line,
+					"媒體新聞(media_today):" if media_lines else "媒體新聞: 無", "\n".join(media_lines),
+					"社交熱點(social_today):" if social_lines else "社交熱點: 無", "\n".join(social_lines),
+					"科技/行業(tech_today):" if tech_lines else "科技/行業: 無", "\n".join(tech_lines),
+					"請輸出 JSON: {hot_topics, sentiment, short_term_price_impact, risk_flags}. hot_topics 需列關聯度與理由；sentiment 需標示方向與強度，短期=1-10天。",
+				]
+			),
+		},
+	]
+	print(f"[debug] social messages: {msg}")
+	return msg
+
+
+def build_bull_messages(tech: str, fund: str, news: str, social: str, decision_row: Dict[str, Any]) -> List[Dict[str, str]]:
+	content = "\n".join(
+		[
+			"多頭研究員：請基於四份報告進行多頭論證，列出看漲理由、關鍵數據、潛在風險與反駁，給出結論。",
+			f"技術分析: {tech}",
+			f"基本面: {fund}",
+			f"新聞舆情: {news}",
+			f"社媒輿情: {social}",
+			f"決策數據: {_format_decision_context(decision_row)}",
+			"輸出 JSON: {bull_view, risks, confidence (0-1)}。",
+		]
+	)
+	print(f"[debug] bull content: {content}")
+	return [{"role": "system", "content": "你是多頭研究員，需站在看漲立場進行辯論。"}, {"role": "user", "content": content}]
+
+
+def build_bear_messages(tech: str, fund: str, news: str, social: str, decision_row: Dict[str, Any]) -> List[Dict[str, str]]:
+	content = "\n".join(
+		[
+			"空頭研究員：請基於四份報告進行空頭論證，列出看跌理由、下行催化、風險對沖，給出結論。",
+			f"技術分析: {tech}",
+			f"基本面: {fund}",
+			f"新聞舆情: {news}",
+			f"社媒輿情: {social}",
+			f"決策數據: {_format_decision_context(decision_row)}",
+			"輸出 JSON: {bear_view, upside_risks, confidence (0-1)}。",
+		]
+	)
+	print(f"[debug] bear content: {content}")
+	return [{"role": "system", "content": "你是空頭研究員，需站在看跌立場進行辯論。"}, {"role": "user", "content": content}]
+
+
+def build_manager_messages(bull: str, bear: str) -> List[Dict[str, str]]:
+	content = "\n".join(
+		[
+			"研究經理：綜合多空觀點，評估置信度，做出初步投資建議 (買入/觀望/賣出) 與理由。",
+			f"多頭觀點: {bull}",
+			f"空頭觀點: {bear}",
+			"輸出 JSON: {manager_view, recommendation, rationale, risks}. recommendation 需包含建議方向與條件。",
+		]
+	)
+	print(f"[debug] manager content: {content}")
+	return [{"role": "system", "content": "你是研究經理，需整合多空並給出結論。"}, {"role": "user", "content": content}]
+
+
+def build_trade_messages(manager: str, decision_row: Dict[str, Any], price_info: Dict[str, Any]) -> List[Dict[str, str]]:
+	stats = price_info.get("stats", {})
+	content = "\n".join(
+		[
+			"最終交易決策顧問：請給出長/中/短期策略、倉位建議、進出場與止損止盈。簡明可執行。",
+			f"研究經理結論: {manager}",
+			f"決策分數與指標: {_format_decision_context(decision_row)}",
+			f"近期價格摘要: last={stats.get('last_close')} ret20={stats.get('return_20d')} vol20={stats.get('volatility_20d')}",
+			"輸出 JSON: {trade_plan: {short, mid, long}, sizing, entries, stops, take_profits, note}.",
+		]
+	)
+	print(f"[debug] trade content: {content}")
+	return [{"role": "system", "content": "你是交易決策顧問，需落地為具體交易計畫。"}, {"role": "user", "content": content}]
+
+
+def call_openrouter(api_key: str, model: str, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 3500) -> str:
+	headers = {
+		"Authorization": f"Bearer {api_key}",
+		"Content-Type": "application/json",
+	}
+	payload = {
+		"model": model,
+		"messages": messages,
+		"temperature": temperature,
+		"max_tokens": max_tokens,
+	}
+	resp = requests.post(OPENROUTER_ENDPOINT, headers=headers, json=payload, timeout=60)
+	if not resp.ok:
+		raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text}")
+	data = resp.json()
+	try:
+		return data["choices"][0]["message"]["content"]
+	except Exception:
+		raise RuntimeError(f"Unexpected OpenRouter response: {data}")
+
+
+def resolve_openrouter_key(explicit_key: Optional[str], config_path: Optional[str]) -> Optional[str]:
+	if explicit_key:
+		k = explicit_key.strip()
+		if k.lower().startswith("bearer "):
+			return k.split(None, 1)[1]
+		return k
+	cfg = load_notify_config(config_path)
+	if isinstance(cfg, dict):
+		v = cfg.get("openrouter_api_key")
+		if v:
+			v2 = str(v).strip()
+			if v2.lower().startswith("bearer "):
+				return v2.split(None, 1)[1]
+			return v2
+	return os.getenv("OPENROUTER_API_KEY")
+
+
+def format_summary(code: str, decision_row: Dict[str, Any], stage_outputs: Dict[str, str], executed: List[str]) -> str:
+	header = f"【{code} LLM 決策】"
+	metrics = f"決策分數: {decision_row.get('final_score', 'N/A')} | kronos={decision_row.get('kronos_score', 'N/A')} | net_c={decision_row.get('net_c', 'N/A')} | buy={decision_row.get('buy', 'N/A')}"
+	lines = [header, metrics, "--- 分階段回應 ---"]
+	for st in executed:
+		lines.append(f"[{st}] {stage_outputs.get(st, '').strip()}")
+	return "\n".join([str(x) for x in lines if str(x).strip()])
+
+
+def parse_args():
+	parser = argparse.ArgumentParser(description="Ask OpenRouter for stock advice with staged multi-role prompts")
+	parser.add_argument("code", help="HK stock code, e.g., 00700.HK or 700")
+	parser.add_argument("--decision_csv", type=str, help="decision CSV path (decision_YYYYMMDD_recorder.csv)")
+	parser.add_argument("--provider_uri", type=str, default="~/.qlib/qlib_data/hk_data", help="qlib provider uri")
+	parser.add_argument("--news_dir", type=str, default=str(Path.home() / ".qlib/qlib_data/hk_data/news"))
+	parser.add_argument("--openrouter_model", type=str, default="tngtech/deepseek-r1t2-chimera:free")
+	parser.add_argument("--openrouter_api_key", type=str, help="override OpenRouter API key")
+	parser.add_argument("--notify_config", type=str, help="path to notify_config.json")
+	parser.add_argument("--temperature", type=float, default=0.7)
+	parser.add_argument("--max_tokens", type=int, default=60000)
+	parser.add_argument("--lookback_days", type=int, default=365)
+	parser.add_argument("--stages", type=str, default="all", help="comma list from: technical,fundamental,news,social,bull,bear,manager,trade (default all)")
+	parser.add_argument("--cache_dir", type=str, default=str(Path.cwd() / "cache_ai_advice"), help="directory to store stage cache")
+	parser.add_argument("--cache_stages", type=str, default="", help="comma list of stages to read/write cache (default none)")
+	parser.add_argument("--telegram_token")
+	parser.add_argument("--telegram_chat_id")
+	parser.add_argument("--send_telegram", action="store_true", help="send summary via Telegram if configured")
+	return parser.parse_args()
+
+
+def _expand_stages(raw: str) -> List[str]:
+	if raw.strip().lower() == "all":
+		selected = set(STAGE_ORDER)
+	else:
+		parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
+		selected = set([p for p in parts if p in STAGE_ORDER])
+	if "manager" in selected:
+		selected.update({"bull", "bear"})
+	if "trade" in selected:
+		selected.update({"manager", "bull", "bear"})
+	return [s for s in STAGE_ORDER if s in selected]
+
+
+def _expand_cache_stages(raw: str) -> List[str]:
+	if not raw:
+		return []
+	parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
+	return [p for p in parts if p in STAGE_ORDER]
+
+
+def main():
+	args = parse_args()
+	news_dir = Path(args.news_dir)
+	stages = _expand_stages(args.stages)
+	cache_dir = Path(args.cache_dir)
+	cache_stages = set(_expand_cache_stages(args.cache_stages))
+	print(f"[info] stages={stages} cache_dir={cache_dir} cache_stages={sorted(cache_stages)}")
+
+	decision_path = Path(args.decision_csv) if args.decision_csv else None
+	if decision_path is None:
+		candidates = sorted(Path.cwd().glob("decision_*.csv"), reverse=True)
+		if not candidates:
+			raise RuntimeError("No decision_*.csv found; please provide --decision_csv")
+		decision_path = candidates[0]
+	print(f"[info] decision_csv={decision_path}")
+
+	decision_row = load_decision_row(decision_path, args.code)
+	print(f"[info] decision row keys sample={list(decision_row.keys())[:10]}")
+	price_info = summarize_prices(args.code, args.provider_uri, lookback_days=args.lookback_days)
+	news_blob = load_company_news(news_dir, args.code)
+	finance_snip = _pick_finance_snippets(news_blob.get("primary", {}))
+
+	api_key = resolve_openrouter_key(args.openrouter_api_key, args.notify_config)
+	if not api_key:
+		raise RuntimeError("Missing OpenRouter API key (set OPENROUTER_API_KEY or notify_config)")
+	print(f"[info] using model={args.openrouter_model} temperature={args.temperature} max_tokens={args.max_tokens}")
+
+	outputs: Dict[str, str] = {}
+	for stage in stages:
+		if stage == "technical":
+			msgs = build_technical_messages(args.code, decision_row, price_info)
+		elif stage == "fundamental":
+			msgs = build_fundamental_messages(args.code, decision_row, finance_snip)
+		elif stage == "news":
+			msgs = build_news_messages(args.code, news_blob)
+		elif stage == "social":
+			msgs = build_social_messages(args.code, news_blob, finance_snip)
+		elif stage == "bull":
+			msgs = build_bull_messages(
+				outputs.get("technical", ""),
+				outputs.get("fundamental", ""),
+				outputs.get("news", ""),
+				outputs.get("social", ""),
+				decision_row,
+			)
+		elif stage == "bear":
+			msgs = build_bear_messages(
+				outputs.get("technical", ""),
+				outputs.get("fundamental", ""),
+				outputs.get("news", ""),
+				outputs.get("social", ""),
+				decision_row,
+			)
+		elif stage == "manager":
+			msgs = build_manager_messages(outputs.get("bull", ""), outputs.get("bear", ""))
+		elif stage == "trade":
+			msgs = build_trade_messages(outputs.get("manager", ""), decision_row, price_info)
+		else:
+			continue
+		cached = load_stage_cache(cache_dir, args.code, stage, args.openrouter_model) if stage in cache_stages else None
+		if cached is not None:
+			text = cached
+		else:
+			print(f"[llm] calling stage={stage} ...")
+			text = call_openrouter(api_key, args.openrouter_model, msgs, temperature=args.temperature, max_tokens=args.max_tokens)
+		# Always save stage output to cache directory (user requested saving regardless of load)
+		try:
+			save_stage_cache(cache_dir, args.code, stage, args.openrouter_model, text)
+		except Exception:
+			# Don't fail the whole run on cache write errors
+			print(f"[cache] warning: failed to save cache for stage={stage}")
+		outputs[stage] = text
+
+	summary = format_summary(args.code, decision_row, outputs, stages)
+	print(summary)
+
+	tok, chat = resolve_notify_params(args.telegram_token, args.telegram_chat_id, args.notify_config)
+	notifier = TelegramNotifier(tok, chat, parse_mode=None)
+	if args.send_telegram and notifier.can_send():
+		notifier.send(summary)
+	elif args.send_telegram:
+		print("[telegram skipped] missing token/chat_id")
+
+
+if __name__ == "__main__":
+	try:
+		main()
+	except Exception as e:
+		print(f"Error: {e}")
+		sys.exit(1)

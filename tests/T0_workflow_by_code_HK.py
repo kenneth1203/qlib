@@ -28,11 +28,14 @@ HK_GBDT_TASK = {
         "module_path": "qlib.contrib.model.gbdt",
         "kwargs": {
             "loss": "mse",
-            "learning_rate": 0.05,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "max_depth": 6,
-            "num_leaves": 64,
+            "colsample_bytree": 0.8879,
+            "learning_rate": 0.0421,
+            "subsample": 0.8789,
+            "lambda_l1": 205.6999,
+            "lambda_l2": 580.9768,
+            "max_depth": 8,
+            "num_leaves": 210,
+            "num_threads": 20,
         },
     },
     "dataset": {
@@ -142,7 +145,7 @@ if __name__ == "__main__":
     # --- Liquidity filter: reuse helper for consistent universe ---
     handler_kwargs = HK_GBDT_TASK["dataset"]["kwargs"]["handler"]["kwargs"]
     keep_insts, info = compute_liquid_instruments(
-        liq_threshold=5_000_000,
+        liq_threshold=60_000_000,
         liq_window=20,
         handler_end_time=handler_kwargs.get("end_time", None),
     )
@@ -209,8 +212,8 @@ if __name__ == "__main__":
             "module_path": "qlib.contrib.strategy.signal_strategy",
             "kwargs": {
                 "signal": (model, dataset),
-                "topk": 20,
-                "n_drop": 5,
+                "topk": 12,
+                "n_drop": 2,
                 "only_tradable": True,
                 "forbid_all_trade_at_limit": True
             },

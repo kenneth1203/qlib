@@ -476,7 +476,7 @@ def make_kronos_scorer(predictor, args):
                 pred_len=args.kronos_pred_len,
                 T=1.0,
                 top_p=0.9,
-                sample_count=10,
+                sample_count=20,
                 verbose=False,
             )
 
@@ -528,7 +528,7 @@ def make_kronos_scorer(predictor, args):
                 else:
                     returns = (pred_close_series / last_close) - 1.0
                     # Trim extreme paths, then average to avoid所有樣本都被頂到同一個截斷值
-                    trimmed = returns.clip(lower=-0.05, upper=0.05)
+                    trimmed = returns.clip(lower=-0.1, upper=0.1)
                     r = float(trimmed.mean())
                 if getattr(args, "kronos_debug", False):
                     try:
@@ -578,7 +578,7 @@ def compute_final_score(model_score, kronos_score, net_score, vol_ratio):
 def buy_filter(row, liq_threshold: float, final_threshold: float):
     try:
         ks = row.get("kronos_score", np.nan)
-        if pd.notna(ks) and float(ks) < 0.5:
+        if pd.notna(ks) and float(ks) < 0.35:
             return False
     except Exception:
         return False
@@ -869,7 +869,7 @@ if __name__ == "__main__":
     parser.add_argument("--provider_uri", default="~/.qlib/qlib_data/hk_data", help="qlib data dir")
     parser.add_argument("--topk", type=int, default=20, help="number of instruments to score")
     parser.add_argument("--lookback", type=int, default=365, help="lookback days for indicators")
-    parser.add_argument("--liq_threshold", type=float, default=5000000.0, help="avg dollar vol gate")
+    parser.add_argument("--liq_threshold", type=float, default=60000000.0, help="avg dollar vol gate")
     parser.add_argument("--liq_window", type=int, default=20, help="window for avg dollar vol")
     parser.add_argument("--allow_partial", action="store_true", help="allow partial scoring for insufficient-history instruments (skip missing indicators instead of penalizing)")
     parser.add_argument("--final_threshold", type=float, default=2.0, help="minimum final_score threshold for buy filter")

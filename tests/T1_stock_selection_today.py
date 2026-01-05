@@ -108,7 +108,7 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
             pass
         liq_window = 20
         keep_insts, info = hkmod.compute_liquid_instruments(
-            liq_threshold=5_000_000,
+            liq_threshold=60_000_000,
             liq_window=liq_window,
             handler_end_time=hkw.get("end_time", None),
         )
