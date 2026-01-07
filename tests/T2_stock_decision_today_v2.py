@@ -44,6 +44,12 @@ from qlib.utils.func import (
     to_qlib_inst,
     load_chinese_name_map,
 )
+# Ensure stdout is UTF-8 on Windows to avoid GBK-related mojibake when printing Chinese
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 import matplotlib.pyplot as plt
 from qlib.utils.notify import TelegramNotifier, resolve_notify_params
 try:
@@ -800,7 +806,9 @@ def main(args, notifier: Optional[TelegramNotifier] = None):
     # Robust date string (handles Timestamp with time component)
     day_str = pd.to_datetime(target_day).strftime("%Y%m%d")
     out_path = f"decision_{day_str}_{args.recorder_id}.csv"
-    out_df[preferred + remaining].to_csv(out_path, index=False, encoding="utf-8-sig")
+    # Sort by final_score (then model_score) before persisting for easier scanning
+    sorted_out = out_df.sort_values(["final_score", "model_score"], ascending=[False, False])
+    sorted_out[preferred + remaining].to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"Saved decision table to {out_path}")
 
     base_cols = ["instrument", "chinese_name", "model_score", "kronos_score", "bull_score", "bear_score", "net_c", "final_score", "streak_days", "avg_dollar_vol", "is_new_listing", "buy"]

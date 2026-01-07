@@ -13,6 +13,7 @@ import datetime
 import os
 import pickle
 from typing import Optional
+import sys
 
 import qlib
 from qlib.workflow import R
@@ -28,6 +29,13 @@ from qlib.utils.func import (
     calendar_last_day,
     next_trading_day_from_future,
 )
+
+# Ensure stdout is UTF-8 on Windows to avoid GBK-related mojibake when printing Chinese
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 
 def _disp_width(x):

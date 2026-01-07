@@ -135,17 +135,23 @@ def save_cache(cache_path: Path, data):
 
 
 def fetch_all(code: str, force_update: bool = False, max_pages: int = 3, sleep_seconds: float = 0.5):
-    cache_path = Path.home() / ".qlib" / "qlib_data" / "hk_data" / "news" / f"{code}.json"
+    # normalize incoming code: accept '00700', '700', or '00700.HK' and produce
+    # two forms: base (digits only, zero-padded 5) for URL fetches, and display
+    # (5-digit.HK) for cache filenames and user-facing outputs.
+    base_digits = ''.join([c for c in str(code) if c.isdigit()])
+    base = base_digits.zfill(5)
+    display = f"{base}.HK"
+    cache_path = Path.home() / ".qlib" / "qlib_data" / "hk_data" / "news" / f"{display}.json"
     if not force_update:
         cached = load_cache(cache_path)
         if cached is not None:
             return cached
-
-    company = fetch_company_info(code)
-    finance = fetch_financial_indicators(code)
-    news = fetch_news_pages(code, max_pages=max_pages, sleep_seconds=sleep_seconds)
+    # use base (digits only) for external fetch URLs
+    company = fetch_company_info(base)
+    finance = fetch_financial_indicators(base)
+    news = fetch_news_pages(base, max_pages=max_pages, sleep_seconds=sleep_seconds)
     result = {
-        "code": code,
+        "code": display,
         "company": company,
         "finance": finance,
         "news": news,

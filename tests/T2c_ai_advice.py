@@ -18,7 +18,7 @@ import os
 import sys
 import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -37,11 +37,32 @@ STAGE_ORDER = ["technical", "fundamental", "news", "social", "bull", "bear", "ma
 
 
 def _cache_path(cache_dir: Path, code: str, stage: str, model: str) -> Path:
+	# store caches under per-code subfolders: cache_dir/<safe_code>/<stage>__<model>.txt
 	cache_dir.mkdir(parents=True, exist_ok=True)
 	safe_code = code.replace("/", "_").replace("\\", "_")
 	safe_stage = stage.replace("/", "_")
 	safe_model = model.replace("/", "_").replace(":", "_")
-	return cache_dir / f"{safe_code}__{safe_stage}__{safe_model}.txt"
+	subdir = cache_dir / safe_code
+	# ensure the per-code folder exists
+	subdir.mkdir(parents=True, exist_ok=True)
+	return subdir / f"{safe_stage}__{safe_model}.txt"
+
+
+def _normalize_display_code(code: str) -> str:
+	"""Normalize various code inputs into 5-digit.HK display form.
+
+	Examples: '700' -> '00700.HK', '00700' -> '00700.HK', '00700.HK' -> '00700.HK'
+	"""
+	s = str(code).strip()
+	# if already in DDDDD.HK form, return as-is
+	import re as _re
+
+	if _re.match(r"^\d{5}\.HK$", s):
+		return s
+	digits = ''.join([c for c in s if c.isdigit()])
+	if not digits:
+		return s
+	return digits.zfill(5) + ".HK"
 
 
 def load_stage_cache(cache_dir: Path, code: str, stage: str, model: str) -> Optional[str]:
@@ -64,6 +85,51 @@ def save_stage_cache(cache_dir: Path, code: str, stage: str, model: str, text: s
 	except Exception:
 		print(f"[cache] save failed stage={stage} path={path}")
 		pass
+
+
+def load_portfolio_list(path: Path) -> List[Any]:
+	if not path.exists():
+		raise FileNotFoundError(f"portfolio file not found: {path}")
+	txt = path.read_text(encoding="utf-8").strip()
+	if not txt:
+		return []
+	# Accept simple plain-text list (one code per line). If file is a JSON list, accept that too.
+	first = txt.lstrip()[0]
+	if first == "[":
+		try:
+			data = json.loads(txt)
+			if isinstance(data, list):
+				return data
+		except Exception:
+			pass
+	# otherwise treat as plain lines
+	lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+	return lines
+
+
+def assemble_portfolio_items(raw_items: List[Any], cache_dir: Path, model: str) -> Tuple[List[Dict[str, str]], List[str]]:
+	items: List[Dict[str, str]] = []
+	missing: List[str] = []
+	for entry in raw_items:
+		if isinstance(entry, str):
+			code = entry
+			summary = load_stage_cache(cache_dir, code, "summary", model)
+			if summary is None:
+				missing.append(code)
+				continue
+			trade = load_stage_cache(cache_dir, code, "trade", model)
+			items.append({"code": code, "summary": summary, "trade": trade or ""})
+		elif isinstance(entry, dict):
+			code = entry.get("code") or entry.get("inst") or entry.get("symbol")
+			if not code:
+				continue
+			summary = entry.get("summary") or load_stage_cache(cache_dir, code, "summary", model)
+			trade = entry.get("trade") or load_stage_cache(cache_dir, code, "trade", model)
+			if not summary:
+				missing.append(code)
+				continue
+			items.append({"code": code, "summary": summary, "trade": trade or ""})
+	return items, missing
 
 
 def _read_json(path: Path) -> Any:
@@ -97,7 +163,23 @@ def load_decision_row(decision_path: Path, code: str) -> Dict[str, Any]:
 	if row.empty:
 		raise ValueError(f"Instrument {code} not found in {decision_path}")
 	print(f"[info] loaded decision row for {target} from {decision_path}")
-	return row.iloc[0].to_dict()
+	# compute 1-based model ranking position within the CSV (if available)
+	model_ranking = None
+	try:
+		pos_df = df.reset_index(drop=True)
+		matches = pos_df[pos_df["_inst"] == target]
+		if matches.empty:
+			# try without .HK suffix
+			bare = target.replace(".HK", "")
+			matches = pos_df[pos_df["_inst"].str.replace(".HK", "", regex=False) == bare]
+		if not matches.empty:
+			model_ranking = int(matches.index[0]) + 1
+	except Exception:
+		model_ranking = None
+	result = row.iloc[0].to_dict()
+	if model_ranking is not None:
+		result["model_ranking"] = model_ranking
+	return result
 
 
 def load_company_news(news_dir: Path, code: str) -> Dict[str, Any]:
@@ -108,7 +190,7 @@ def load_company_news(news_dir: Path, code: str) -> Dict[str, Any]:
 	return {"primary": primary, "trending": trending}
 
 
-def summarize_prices(code: str, provider_uri: str, lookback_days: int = 365) -> Dict[str, Any]:
+def summarize_prices(code: str, provider_uri: str, lookback_days: int = 400) -> Dict[str, Any]:
 	qlib.init(provider_uri=os.path.expanduser(provider_uri), region=REG_HK)
 	print(f"[info] qlib initialized provider={provider_uri} region=HK")
 	end_dt = datetime.date.today()
@@ -160,6 +242,10 @@ def summarize_prices(code: str, provider_uri: str, lookback_days: int = 365) -> 
 	df2.columns = ["open", "high", "low", "close", "volume"]
 	df = df2.reset_index().set_index("datetime").sort_index()
 	close = df["close"].astype(float)
+	high = df["high"].astype(float)
+	low = df["low"].astype(float)
+	open_ = df["open"].astype(float)
+	volume = df["volume"].astype(float)
 	stats = {
 		"last_date": close.index.max().strftime("%Y-%m-%d"),
 		"last_close": float(close.iloc[-1]),
@@ -178,7 +264,68 @@ def summarize_prices(code: str, provider_uri: str, lookback_days: int = 365) -> 
 		"ma20_gt_ma60": bool(ma_short.iloc[-1] > ma_mid.iloc[-1]) if not np.isnan(ma_short.iloc[-1]) and not np.isnan(ma_mid.iloc[-1]) else None,
 		"ma60_gt_ma120": bool(ma_mid.iloc[-1] > ma_long.iloc[-1]) if not np.isnan(ma_mid.iloc[-1]) and not np.isnan(ma_long.iloc[-1]) else None,
 	}
-	tail = df.tail(60).copy()
+
+	# --- RSI(14) ---
+	try:
+		delta = close.diff()
+		up = delta.clip(lower=0.0)
+		down = -delta.clip(upper=0.0)
+		rs_up = up.rolling(window=14).mean()
+		rs_down = down.rolling(window=14).mean()
+		rs = rs_up / rs_down
+		rsi = 100.0 - (100.0 / (1.0 + rs))
+		stats["rsi_14"] = float(rsi.iloc[-1]) if len(rsi) > 0 and not np.isnan(rsi.iloc[-1]) else None
+	except Exception:
+		stats["rsi_14"] = None
+
+	# --- ATR(14) ---
+	try:
+		prev_close = close.shift(1)
+		tr1 = high - low
+		tr2 = (high - prev_close).abs()
+		tr3 = (low - prev_close).abs()
+		tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+		atr = tr.rolling(window=14).mean()
+		stats["atr_14"] = float(atr.iloc[-1]) if len(atr) > 0 and not np.isnan(atr.iloc[-1]) else None
+	except Exception:
+		stats["atr_14"] = None
+
+	# --- MACD(12,26,9) ---
+	try:
+		ema12 = close.ewm(span=12, adjust=False).mean()
+		ema26 = close.ewm(span=26, adjust=False).mean()
+		macd_line = ema12 - ema26
+		signal = macd_line.ewm(span=9, adjust=False).mean()
+		hist = macd_line - signal
+		stats["macd"] = {
+			"macd": float(macd_line.iloc[-1]) if len(macd_line) > 0 and not np.isnan(macd_line.iloc[-1]) else None,
+			"signal": float(signal.iloc[-1]) if len(signal) > 0 and not np.isnan(signal.iloc[-1]) else None,
+			"hist": float(hist.iloc[-1]) if len(hist) > 0 and not np.isnan(hist.iloc[-1]) else None,
+			"hist_mean_20": float(hist.tail(20).mean()) if len(hist) > 0 else None,
+			"hist_std_20": float(hist.tail(20).std()) if len(hist) > 0 else None,
+			"hist_positive": bool(hist.iloc[-1] > 0) if len(hist) > 0 and not np.isnan(hist.iloc[-1]) else None,
+		}
+	except Exception:
+		stats["macd"] = {"macd": None, "signal": None, "hist": None, "hist_mean_20": None, "hist_std_20": None, "hist_positive": None}
+
+	# --- KDJ (9,3,3) ---
+	try:
+		low_n = low.rolling(window=9).min()
+		high_n = high.rolling(window=9).max()
+		den = (high_n - low_n)
+		rsv = (close - low_n) / den * 100.0
+		rsv = rsv.fillna(0.0)
+		K = rsv.ewm(alpha=1/3, adjust=False).mean()
+		KD = K.ewm(alpha=1/3, adjust=False).mean()
+		J = 3.0 * K - 2.0 * D
+		stats["kdj"] = {
+			"k": float(K.iloc[-1]) if len(K) > 0 and not np.isnan(K.iloc[-1]) else None,
+			"d": float(KD.iloc[-1]) if len(KD) > 0 and not np.isnan(KD.iloc[-1]) else None,
+			"j": float(J.iloc[-1]) if len(J) > 0 and not np.isnan(J.iloc[-1]) else None,
+		}
+	except Exception:
+		stats["kdj"] = {"k": None, "d": None, "j": None}
+	tail = df.tail(365).copy()
 	tail.index = tail.index.strftime("%Y-%m-%d")
 	return {"stats": stats, "recent_ohlcv": tail}
 
@@ -205,6 +352,7 @@ def _pick_finance_snippets(company_blob: Dict[str, Any]) -> Dict[str, Any]:
 def _format_decision_context(decision_row: Dict[str, Any]) -> str:
 	keys = [
 		"model_score",
+		"model_ranking",
 		"kronos_score",
 		"bull_score",
 		"bear_score",
@@ -229,8 +377,26 @@ def _recent_ohlcv_lines(price_info: Dict[str, Any], days: int = 10) -> List[str]
 	tail = recent.tail(days)
 	lines: List[str] = []
 	for idx, row in tail.iterrows():
+		def _fmt(x):
+			try:
+				return f"{float(x):.2f}"
+			except Exception:
+				return "NA"
+
+		vol = row.get("volume") if isinstance(row, (dict, pd.Series)) else None
+		if pd.notna(vol):
+			try:
+				vol_str = str(int(vol))
+			except Exception:
+				try:
+					vol_str = str(int(float(vol)))
+				except Exception:
+					vol_str = "NA"
+		else:
+			vol_str = "NA"
+
 		lines.append(
-			f"{idx}: o={row['open']:.2f} h={row['high']:.2f} l={row['low']:.2f} c={row['close']:.2f} v={int(row['volume'])}"
+			f"{idx}: o={_fmt(row.get('open'))} h={_fmt(row.get('high'))} l={_fmt(row.get('low'))} c={_fmt(row.get('close'))} v={vol_str}"
 		)
 	return lines
 
@@ -238,9 +404,37 @@ def _recent_ohlcv_lines(price_info: Dict[str, Any], days: int = 10) -> List[str]
 def build_technical_messages(code: str, decision_row: Dict[str, Any], price_info: Dict[str, Any]) -> List[Dict[str, str]]:
 	stats = price_info.get("stats", {})
 	ma = stats.get("ma_trend", {})
+
+	def _fmt_num(val: Any, fmt: str = ".2f") -> str:
+		"""Format numeric values safely for prompt strings."""
+		try:
+			fval = float(val)
+			if np.isnan(fval):
+				return "NA"
+			return format(fval, fmt)
+		except Exception:
+			return "NA"
+
+	macd_stats = stats.get("macd", {}) or {}
+	kdj_stats = stats.get("kdj", {}) or {}
+	rsi_str = _fmt_num(stats.get("rsi_14"))
+	atr_str = _fmt_num(stats.get("atr_14"))
+	macd_str = " ".join(
+		[
+			f"macd={_fmt_num(macd_stats.get('macd'))}",
+			f"sig={_fmt_num(macd_stats.get('signal'))}",
+			f"hist={_fmt_num(macd_stats.get('hist'))}",
+			f"hist_mean20={_fmt_num(macd_stats.get('hist_mean_20'))}",
+			f"hist_std20={_fmt_num(macd_stats.get('hist_std_20'))}",
+			f"hist_pos={macd_stats.get('hist_positive')}",
+		]
+	)
+	kdj_str = f"K={_fmt_num(kdj_stats.get('k'))} D={_fmt_num(kdj_stats.get('d'))} J={_fmt_num(kdj_stats.get('j'))}"
 	scoring = (
 		"final_score = (w_model * model_score + w_net * net_c) * kronos_score * 100; "
-		"kronos_score = 1/(1+exp(-alpha*r)), alpha=5; net_c = 1/(1+exp(-net_score/3)), net_score=bull_score-bear_score; "
+		"model_score = Qlib預測模型分數(0-1); 在topk20名單中排名越前分數越高; "
+		"net_c = 1/(1+exp(-net_score/3)), net_score=bull_score-bear_score; bull_score 和 bear_score 分別是技術指標中的多頭和空頭得分; "
+		"kronos_score = 1/(1+exp(-alpha*r)), alpha=5;  kronos 為預測未來14日股價走勢，數據靠近0.5為中性。"
 		"streak_days=qlib預測TopK連續出現天數; avg_dollar_vol=平均成交金額; buy=True 表示通過基本篩選。"
 	)
 	price_summary = (
@@ -249,12 +443,15 @@ def build_technical_messages(code: str, decision_row: Dict[str, Any], price_info
 		f" | 1年: {stats.get('return_1y', np.nan):.2%} 波動率20日: {stats.get('volatility_20d', np.nan):.2%}"
 		f" | MA20={ma.get('ma20')} MA60={ma.get('ma60')} MA120={ma.get('ma120')}"
 		f" | MA20>MA60={ma.get('ma20_gt_ma60')} MA60>MA120={ma.get('ma60_gt_ma120')}"
+		f" | RSI14={rsi_str} ATR14={atr_str}"
+		f" | MACD({macd_str})"
+		f" | KDJ({kdj_str})"
 	)
-	recent_lines = _recent_ohlcv_lines(price_info, days=30)
+	recent_lines = _recent_ohlcv_lines(price_info, days=180)
 	msg = [
 		{
 			"role": "system",
-			"content": "你是股票市場技術分析師，聚焦K線形態、趨勢、支撐阻力、動能、量價結構、風險點，並給出買賣時機初步判斷。",
+			"content": "你是股票市場技術分析師，聚焦K線形態、技術指標、趨勢結構、超賣超買、支撐阻力、動能分析、量價結構、風險點，並給出買賣時機初步判斷。",
 		},
 		{"role": "system", "content": scoring},
 		{
@@ -264,14 +461,14 @@ def build_technical_messages(code: str, decision_row: Dict[str, Any], price_info
 					f"股票代號: {code}",
 					f"決策數據: {_format_decision_context(decision_row)}",
 					f"價格摘要: {price_summary}",
-					"最近12日OHLCV:" if recent_lines else "",
+					"最近180日OHLCV:" if recent_lines else "",
 					"\n".join(recent_lines),
 					"請輸出 JSON: {technical_report, signals, risk}. signals 包含買/賣/觀望和理由。",
 				]
 			),
 		},
 	]
-	print(f"[debug] technical messages: {msg}")
+	#print(f"[debug] technical messages: {msg}")
 	return msg
 
 def build_fundamental_messages(code: str, decision_row: Dict[str, Any], finance_snip: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -298,7 +495,7 @@ def build_fundamental_messages(code: str, decision_row: Dict[str, Any], finance_
 			),
 		},
 	]
-	print(f"[debug] fundamental messages: {msg}")
+	#print(f"[debug] fundamental messages: {msg}")
 	return msg
 
 
@@ -338,7 +535,7 @@ def build_news_messages(code: str, news_blob: Dict[str, Any]) -> List[Dict[str, 
 			),
 		},
 	]
-	print(f"[debug] news messages: {msg}")
+	#print(f"[debug] news messages: {msg}")
 	return msg
 
 
@@ -368,9 +565,59 @@ def build_social_messages(code: str, news_blob: Dict[str, Any], finance_snip: Di
 			),
 		},
 	]
-	print(f"[debug] social messages: {msg}")
+	#print(f"[debug] social messages: {msg}")
 	return msg
 
+
+def build_portfolio_messages(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
+	lines = []
+	for it in items:
+		code = it.get("code", "")
+		summary = it.get("summary", "")
+		lines.append(f"{code}: {summary}")
+	scoring = (
+		"排序邏輯: 先對每檔打短期技術信號分、中期基本面改善分、長期估值空間分，再做風險調整(波動、流動性、負面事件)，並結合 bull/bear 置信度。"
+	)
+	msg = [
+		{"role": "system", "content": "你是投資組合評審員，根據多支股票的摘要做綜合排序並輸出JSON格式。"},
+		{
+			"role": "user",
+			"content": "\n".join(
+				[
+					scoring,
+					"請從每支股票的 summary 抽取技術面、基本面、新聞情緒、bull/bear置信度，輸出綜合排序表 (JSON 格式)。",
+					"股票清單摘要:",
+					"\n".join(lines),
+					"請輸出: JSON {ranking: [{code, chinese_name, decision, entry_point, hold_time, take_profit, support_position, stop_loss, rationale, score: {tech_score, fundamental_score, valuation_score, sentiment, bull_conf, bear_conf, risk_adjust, total_score}}], top_picks, notes}。",
+					"以上JSON欄位說明包括但不限於：chinese_name=於港股巿場中文名稱；decision=買入/觀望/賣出；entry_point=建議進場點;hold_time=建議持倉時間(短中長期)；take_profit=建議止盈點(三階段)；support_position=股價支撐位(多個)；stop_loss=建議止損點；rationale=決策理由摘要；top_picks=首選標的清單；notes=其他說明。",
+				]
+			),
+		},
+	]
+	return msg
+
+def build_portfolio_lite_messages(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
+	lines = []
+	for it in items:
+		code = it.get("code", "")
+		trade = it.get("trade", "")
+		lines.append(f"{code}: {trade}")
+	msg = [
+		{"role": "system", "content": "你是一位投資顧問代理，負責將多支股票的交易計劃整理成表格。請務必輸出 MarkdownV2 格式。"},
+		{
+			"role": "user",
+			"content": "\n".join(
+				[ 
+					"請根據每支股票的交易計劃，整理成簡單明瞭的交易計劃表格", 
+					"股票交易計劃摘要:",
+					"\n".join(lines), 
+					"請輸出: 交易計劃表格，欄位包括：股票代號、決策、進場點、止盈點、止損點、倉位。",
+				]
+			),
+		},
+	]
+	#print(msg)
+	return msg
 
 def build_bull_messages(tech: str, fund: str, news: str, social: str, decision_row: Dict[str, Any]) -> List[Dict[str, str]]:
 	content = "\n".join(
@@ -384,7 +631,7 @@ def build_bull_messages(tech: str, fund: str, news: str, social: str, decision_r
 			"輸出 JSON: {bull_view, risks, confidence (0-1)}。",
 		]
 	)
-	print(f"[debug] bull content: {content}")
+	#print(f"[debug] bull content: {content}")
 	return [{"role": "system", "content": "你是多頭研究員，需站在看漲立場進行辯論。"}, {"role": "user", "content": content}]
 
 
@@ -400,7 +647,7 @@ def build_bear_messages(tech: str, fund: str, news: str, social: str, decision_r
 			"輸出 JSON: {bear_view, upside_risks, confidence (0-1)}。",
 		]
 	)
-	print(f"[debug] bear content: {content}")
+	#print(f"[debug] bear content: {content}")
 	return [{"role": "system", "content": "你是空頭研究員，需站在看跌立場進行辯論。"}, {"role": "user", "content": content}]
 
 
@@ -413,7 +660,7 @@ def build_manager_messages(bull: str, bear: str) -> List[Dict[str, str]]:
 			"輸出 JSON: {manager_view, recommendation, rationale, risks}. recommendation 需包含建議方向與條件。",
 		]
 	)
-	print(f"[debug] manager content: {content}")
+	#print(f"[debug] manager content: {content}")
 	return [{"role": "system", "content": "你是研究經理，需整合多空並給出結論。"}, {"role": "user", "content": content}]
 
 
@@ -421,14 +668,14 @@ def build_trade_messages(manager: str, decision_row: Dict[str, Any], price_info:
 	stats = price_info.get("stats", {})
 	content = "\n".join(
 		[
-			"最終交易決策顧問：請給出長/中/短期策略、倉位建議、進出場與止損止盈。簡明可執行。",
+			"最終交易決策顧問：請給出買入/賣出/觀望訊號、長/中/短期策略、倉位建議、進出場與止損止盈。簡明可執行。",
 			f"研究經理結論: {manager}",
 			f"決策分數與指標: {_format_decision_context(decision_row)}",
 			f"近期價格摘要: last={stats.get('last_close')} ret20={stats.get('return_20d')} vol20={stats.get('volatility_20d')}",
-			"輸出 JSON: {trade_plan: {short, mid, long}, sizing, entries, stops, take_profits, note}.",
+			"輸出 JSON: {trade_plan:decision, {short, mid, long}, sizing, entries, stops, take_profits, note}.",
 		]
 	)
-	print(f"[debug] trade content: {content}")
+	#print(f"[debug] trade content: {content}")
 	return [{"role": "system", "content": "你是交易決策顧問，需落地為具體交易計畫。"}, {"role": "user", "content": content}]
 
 
@@ -481,7 +728,7 @@ def format_summary(code: str, decision_row: Dict[str, Any], stage_outputs: Dict[
 
 def parse_args():
 	parser = argparse.ArgumentParser(description="Ask OpenRouter for stock advice with staged multi-role prompts")
-	parser.add_argument("code", help="HK stock code, e.g., 00700.HK or 700")
+	parser.add_argument("code", nargs="?", help="HK stock code, e.g., 00700.HK or 700; optional when --portfolio is used")
 	parser.add_argument("--decision_csv", type=str, help="decision CSV path (decision_YYYYMMDD_recorder.csv)")
 	parser.add_argument("--provider_uri", type=str, default="~/.qlib/qlib_data/hk_data", help="qlib provider uri")
 	parser.add_argument("--news_dir", type=str, default=str(Path.home() / ".qlib/qlib_data/hk_data/news"))
@@ -492,8 +739,15 @@ def parse_args():
 	parser.add_argument("--max_tokens", type=int, default=60000)
 	parser.add_argument("--lookback_days", type=int, default=365)
 	parser.add_argument("--stages", type=str, default="all", help="comma list from: technical,fundamental,news,social,bull,bear,manager,trade (default all)")
-	parser.add_argument("--cache_dir", type=str, default=str(Path.cwd() / "cache_ai_advice"), help="directory to store stage cache")
+	parser.add_argument(
+		"--cache_dir",
+		type=str,
+		default=str(Path.home() / ".qlib" / "qlib_data" / "hk_data" / "cache_ai_advice"),
+		help="directory to store stage cache",
+	)
 	parser.add_argument("--cache_stages", type=str, default="", help="comma list of stages to read/write cache (default none)")
+	# --portfolio_file removed: use --portfolio (comma-separated codes) instead
+	parser.add_argument("--portfolio", type=str, help="comma-separated list of instrument codes for portfolio ranking, e.g. 00700.HK,00005.HK")
 	parser.add_argument("--telegram_token")
 	parser.add_argument("--telegram_chat_id")
 	parser.add_argument("--send_telegram", action="store_true", help="send summary via Telegram if configured")
@@ -516,8 +770,13 @@ def _expand_stages(raw: str) -> List[str]:
 def _expand_cache_stages(raw: str) -> List[str]:
 	if not raw:
 		return []
+	if raw.strip().lower() == "all":
+		# Return all defined stages plus portfolio
+		return [s for s in STAGE_ORDER] + ["portfolio"]
 	parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
-	return [p for p in parts if p in STAGE_ORDER]
+	extra = set(["portfolio"])  # allow portfolio as cache-stage
+	allowed = set(STAGE_ORDER) | extra
+	return [p for p in parts if p in allowed]
 
 
 def main():
@@ -527,6 +786,50 @@ def main():
 	cache_dir = Path(args.cache_dir)
 	cache_stages = set(_expand_cache_stages(args.cache_stages))
 	print(f"[info] stages={stages} cache_dir={cache_dir} cache_stages={sorted(cache_stages)}")
+	if args.portfolio:
+		# normalize portfolio codes to display form (DDDDD.HK)
+		raw_port = [_normalize_display_code(s.strip()) for s in str(args.portfolio).split(",") if s.strip()]
+		api_key = resolve_openrouter_key(args.openrouter_api_key, args.notify_config)
+		if not api_key:
+			raise RuntimeError("Missing OpenRouter API key (set OPENROUTER_API_KEY or notify_config)")
+		items, missing = assemble_portfolio_items(raw_port, cache_dir, args.openrouter_model)
+		if not items:
+			raise RuntimeError(f"No summaries found for portfolio codes; missing={missing}")
+		#msgs_lite = build_portfolio_lite_messages(items)
+		#print("[llm] calling portfolio lite ...")
+		#text = call_openrouter(api_key, args.openrouter_model, msgs_lite, temperature=args.temperature, max_tokens=args.max_tokens)
+		#print(text)
+		#if notifier.can_send():
+		#	notifier.send(text)
+		#else:
+		#	print("error sending telegram.")
+		# now do full portfolio ranking
+		msgs = build_portfolio_messages(items)
+		cached = load_stage_cache(cache_dir, "portfolio", "portfolio", args.openrouter_model) if "portfolio" in cache_stages else None
+		if cached is not None:
+			text = cached
+		else:
+			print("[llm] calling portfolio ...")
+			text = call_openrouter(api_key, args.openrouter_model, msgs, temperature=args.temperature, max_tokens=args.max_tokens)
+		try:
+			save_stage_cache(cache_dir, "portfolio", "portfolio", args.openrouter_model, text)
+		except Exception:
+			print("[cache] warning: failed to save cache for portfolio")
+		#print(text)
+		tok, chat = resolve_notify_params(args.telegram_token, args.telegram_chat_id, args.notify_config)
+		notifier = TelegramNotifier(tok, chat, parse_mode=None)
+		if notifier.can_send():
+			notifier.send(text)
+		else:
+			print("error sending telegram.")
+		if missing:
+			print(f"[portfolio] missing summaries for: {missing}")
+		return
+
+	if not args.code:
+		raise RuntimeError("Missing code; provide CODE or use --portfolio")
+	# normalize requested code to display form (DDDDD.HK) so cache/news filenames use HK
+	args.code = _normalize_display_code(args.code)
 
 	decision_path = Path(args.decision_csv) if args.decision_csv else None
 	if decision_path is None:
@@ -594,7 +897,12 @@ def main():
 		outputs[stage] = text
 
 	summary = format_summary(args.code, decision_row, outputs, stages)
-	print(summary)
+	#print(summary)
+	# also save the combined summary to cache for later retrieval
+	try:
+		save_stage_cache(cache_dir, args.code, "summary", args.openrouter_model, summary)
+	except Exception:
+		print("[cache] warning: failed to save summary cache")
 
 	tok, chat = resolve_notify_params(args.telegram_token, args.telegram_chat_id, args.notify_config)
 	notifier = TelegramNotifier(tok, chat, parse_mode=None)
