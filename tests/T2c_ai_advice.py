@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import time
+import random
 import requests
 
 import qlib
@@ -30,6 +32,12 @@ from qlib.data import D
 from qlib.utils.func import to_qlib_inst
 from qlib.utils.notify import TelegramNotifier, resolve_notify_params, load_notify_config
 
+# Ensure stdout is UTF-8 on Windows to avoid GBK-related mojibake when printing Chinese
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 TRENDING_FILES = ["finance_today.json", "media_today.json", "social_today.json", "tech_today.json"]
@@ -79,6 +87,12 @@ def load_stage_cache(cache_dir: Path, code: str, stage: str, model: str) -> Opti
 
 def save_stage_cache(cache_dir: Path, code: str, stage: str, model: str, text: str) -> None:
 	path = _cache_path(cache_dir, code, stage, model)
+	# For portfolio aggregation runs (batch mode), avoid overwriting existing cache in the same day
+	if stage == "portfolio":
+		stamp = datetime.date.today().strftime("%Y%m%d")
+		suffix = int(time.time())
+		alt = path.with_name(f"{stage}_{stamp}_{suffix}__{model.replace('/', '_').replace(':', '_')}.txt")
+		path = alt
 	try:
 		path.write_text(str(text), encoding="utf-8")
 		print(f"[cache] saved stage={stage} path={path}")
@@ -141,6 +155,40 @@ def _read_json(path: Path) -> Any:
 		return None
 
 
+def _parse_rating_date(s: Any) -> Optional[datetime.date]:
+	"""Parse various date string formats to date; return None if invalid."""
+	if s is None:
+		return None
+	try:
+		txt = str(s).strip()
+		if not txt:
+			return None
+		# Common formats seen on sites
+		fmts = [
+			"%Y-%m-%d",
+			"%Y/%m/%d",
+			"%Y-%m-%d %H:%M",
+			"%Y/%m/%d %H:%M",
+			"%Y-%m-%d %H:%M:%S",
+			"%Y/%m/%d %H:%M:%S",
+		]
+		for fmt in fmts:
+			try:
+				return datetime.datetime.strptime(txt, fmt).date()
+			except Exception:
+				pass
+		# Fallback to pandas if available
+		try:
+			ts = pd.to_datetime(txt, errors="coerce")
+			if pd.isna(ts):
+				return None
+			return ts.date()
+		except Exception:
+			return None
+	except Exception:
+		return None
+
+
 def _select_instrument(row_inst: str) -> str:
 	try:
 		return to_qlib_inst(row_inst)
@@ -161,10 +209,24 @@ def load_decision_row(decision_path: Path, code: str) -> Dict[str, Any]:
 		bare = target.replace(".HK", "")
 		row = df[df["_inst"].str.replace(".HK", "", regex=False) == bare]
 	if row.empty:
-		raise ValueError(f"Instrument {code} not found in {decision_path}")
+		print(f"[warn] Instrument {code} not found in {decision_path}; using zeroed decision data")
+		return {
+			"_inst": target,
+			"model_score": 0,
+			"kronos_score": 0,
+			"bull_score": 0,
+			"bear_score": 0,
+			"net_score": 0,
+			"net_c": 0,
+			"final_score": 0,
+			"streak_days": 0,
+			"avg_dollar_vol": 0,
+			"buy": False,
+			"final_score_ranking": None,
+		}
 	print(f"[info] loaded decision row for {target} from {decision_path}")
 	# compute 1-based model ranking position within the CSV (if available)
-	model_ranking = None
+	final_score_ranking = None
 	try:
 		pos_df = df.reset_index(drop=True)
 		matches = pos_df[pos_df["_inst"] == target]
@@ -173,12 +235,12 @@ def load_decision_row(decision_path: Path, code: str) -> Dict[str, Any]:
 			bare = target.replace(".HK", "")
 			matches = pos_df[pos_df["_inst"].str.replace(".HK", "", regex=False) == bare]
 		if not matches.empty:
-			model_ranking = int(matches.index[0]) + 1
+			final_score_ranking = int(matches.index[0]) + 1
 	except Exception:
-		model_ranking = None
+		final_score_ranking = None
 	result = row.iloc[0].to_dict()
-	if model_ranking is not None:
-		result["model_ranking"] = model_ranking
+	if final_score_ranking is not None:
+		result["final_score_ranking"] = final_score_ranking
 	return result
 
 
@@ -338,6 +400,38 @@ def _pick_finance_snippets(company_blob: Dict[str, Any]) -> Dict[str, Any]:
 	review = company.get("review", "") if isinstance(company, dict) else ""
 	outlook = company.get("outlook", "") if isinstance(company, dict) else ""
 	finance = company_blob.get("finance", {}) if isinstance(company_blob.get("finance"), dict) else {}
+	dividends = company_blob.get("dividends", []) if isinstance(company_blob.get("dividends"), list) else []
+	rights = company_blob.get("rights", {}) if isinstance(company_blob.get("rights"), dict) else {}
+	major_holder_changes_raw = rights.get("major_holder_changes", []) if isinstance(rights.get("major_holder_changes"), list) else []
+	# keep only last 1 year of major holder changes; fallback to latest 10 by date if none
+	cutoff_mh = datetime.date.today() - datetime.timedelta(days=365)
+	major_holder_changes: List[Dict[str, Any]] = []
+	for r in major_holder_changes_raw:
+		if isinstance(r, dict):
+			dt = _parse_rating_date(r.get("date"))
+			if dt and dt >= cutoff_mh:
+				major_holder_changes.append(r)
+	if not major_holder_changes and major_holder_changes_raw:
+		def _key_mh(x):
+			dt = _parse_rating_date(x.get("date")) if isinstance(x, dict) else None
+			return dt or datetime.date.min
+		major_holder_changes = sorted([r for r in major_holder_changes_raw if isinstance(r, dict)], key=_key_mh, reverse=True)[:10]
+	share_buyback = rights.get("share_buyback", []) if isinstance(rights.get("share_buyback"), list) else []
+	ratings_raw = company_blob.get("ratings", []) if isinstance(company_blob.get("ratings"), list) else []
+	# keep only last 60 days of ratings; fallback to latest 5 by date if none
+	cutoff = datetime.date.today() - datetime.timedelta(days=60)
+	ratings: List[Dict[str, Any]] = []
+	for r in ratings_raw:
+		if isinstance(r, dict):
+			dt = _parse_rating_date(r.get("rating_date"))
+			if dt and dt >= cutoff:
+				ratings.append(r)
+	if not ratings and ratings_raw:
+		# fallback: sort by rating_date desc and take latest 5
+		def _key_r(x):
+			dt = _parse_rating_date(x.get("rating_date")) if isinstance(x, dict) else None
+			return dt or datetime.date.min
+		ratings = sorted([r for r in ratings_raw if isinstance(r, dict)], key=_key_r, reverse=True)[:5]
 	return {
 		"profile": profile,
 		"review": review,
@@ -346,13 +440,17 @@ def _pick_finance_snippets(company_blob: Dict[str, Any]) -> Dict[str, Any]:
 		"finance_status": finance.get("finance_status", []),
 		"balance_sheet": finance.get("balance_sheet", []),
 		"cash_flow": finance.get("cash_flow", []),
+		"dividends": dividends,
+		"rights_major_holder_changes": major_holder_changes,
+		"rights_share_buyback": share_buyback,
+		"ratings": ratings,
 	}
 
 
 def _format_decision_context(decision_row: Dict[str, Any]) -> str:
 	keys = [
+		"final_score_ranking",
 		"model_score",
-		"model_ranking",
 		"kronos_score",
 		"bull_score",
 		"bear_score",
@@ -463,7 +561,7 @@ def build_technical_messages(code: str, decision_row: Dict[str, Any], price_info
 					f"價格摘要: {price_summary}",
 					"最近180日OHLCV:" if recent_lines else "",
 					"\n".join(recent_lines),
-					"請輸出 JSON: {technical_report, signals, risk}. signals 包含買/賣/觀望和理由。",
+					"請輸出 JSON: {technical_report, signals, risk, final_score_ranking}. signals 包含買/賣/觀望和理由。",
 				]
 			),
 		},
@@ -490,7 +588,11 @@ def build_fundamental_messages(code: str, decision_row: Dict[str, Any], finance_
 					f"財務狀況(finance_status): {finance_snip.get('finance_status', [])}",
 					f"資產負債表(balance_sheet): {finance_snip.get('balance_sheet', [])}",
 					f"現金流量表(cash_flow): {finance_snip.get('cash_flow', [])}",
-					"請輸出 JSON: {fundamental_report, valuation_view, risk}. 務必先總結重點，再給結論。",
+					f"分紅派息(dividends): {finance_snip.get('dividends', [])}",
+					f"權益變動-主要持有人(major_holder_changes): {finance_snip.get('rights_major_holder_changes', [])}",
+					f"權益變動-股份回購(share_buyback): {finance_snip.get('rights_share_buyback', [])}",
+					f"投行評級(ratings): {finance_snip.get('ratings', [])}",
+					"請輸出 JSON: {company_name_chinese, fundamental_report, valuation_view, risk}. 務必先總結重點，再給結論。",
 				]
 			),
 		},
@@ -579,7 +681,7 @@ def build_portfolio_messages(items: List[Dict[str, str]]) -> List[Dict[str, str]
 		"排序邏輯: 先對每檔打短期技術信號分、中期基本面改善分、長期估值空間分，再做風險調整(波動、流動性、負面事件)，並結合 bull/bear 置信度。"
 	)
 	msg = [
-		{"role": "system", "content": "你是投資組合評審員，根據多支股票的摘要做綜合排序並輸出JSON格式。"},
+		{"role": "system", "content": "你是投資組合評審員，根據多支股票的摘要做綜合排序並輸出JSON格式，使用繁體中文，不要刪減任何一支股票。"},
 		{
 			"role": "user",
 			"content": "\n".join(
@@ -588,35 +690,13 @@ def build_portfolio_messages(items: List[Dict[str, str]]) -> List[Dict[str, str]
 					"請從每支股票的 summary 抽取技術面、基本面、新聞情緒、bull/bear置信度，輸出綜合排序表 (JSON 格式)。",
 					"股票清單摘要:",
 					"\n".join(lines),
-					"請輸出: JSON {ranking: [{code, chinese_name, decision, entry_point, hold_time, take_profit, support_position, stop_loss, rationale, score: {tech_score, fundamental_score, valuation_score, sentiment, bull_conf, bear_conf, risk_adjust, total_score}}], top_picks, notes}。",
-					"以上JSON欄位說明包括但不限於：chinese_name=於港股巿場中文名稱；decision=買入/觀望/賣出；entry_point=建議進場點;hold_time=建議持倉時間(短中長期)；take_profit=建議止盈點(三階段)；support_position=股價支撐位(多個)；stop_loss=建議止損點；rationale=決策理由摘要；top_picks=首選標的清單；notes=其他說明。",
+					"請輸出: JSON {ranking: [{code, company_name_chinese, decision, entry_point, hold_time, take_profit, support_position, stop_loss, rationale, final_score_ranking, score: {tech_score, fundamental_score, valuation_score, sentiment, bull_conf, bear_conf, risk_adjust, total_score}}], top_picks, notes}。",
+					"以上JSON欄位說明包括但不限於：company_name_chinese=於港股巿場中文名稱；decision=買入/觀望/賣出；entry_point=建議進場點;hold_time=建議持倉時間(短中長期)；take_profit=建議止盈點(三階段)；support_position=股價支撐位(多個)；stop_loss=建議止損點；rationale=決策理由摘要；top_picks=首選標的清單；notes=其他說明。",
 				]
 			),
 		},
 	]
-	return msg
-
-def build_portfolio_lite_messages(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
-	lines = []
-	for it in items:
-		code = it.get("code", "")
-		trade = it.get("trade", "")
-		lines.append(f"{code}: {trade}")
-	msg = [
-		{"role": "system", "content": "你是一位投資顧問代理，負責將多支股票的交易計劃整理成表格。請務必輸出 MarkdownV2 格式。"},
-		{
-			"role": "user",
-			"content": "\n".join(
-				[ 
-					"請根據每支股票的交易計劃，整理成簡單明瞭的交易計劃表格", 
-					"股票交易計劃摘要:",
-					"\n".join(lines), 
-					"請輸出: 交易計劃表格，欄位包括：股票代號、決策、進場點、止盈點、止損點、倉位。",
-				]
-			),
-		},
-	]
-	#print(msg)
+	#print(f"[debug] portfolio messages: {msg}")
 	return msg
 
 def build_bull_messages(tech: str, fund: str, news: str, social: str, decision_row: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -672,32 +752,80 @@ def build_trade_messages(manager: str, decision_row: Dict[str, Any], price_info:
 			f"研究經理結論: {manager}",
 			f"決策分數與指標: {_format_decision_context(decision_row)}",
 			f"近期價格摘要: last={stats.get('last_close')} ret20={stats.get('return_20d')} vol20={stats.get('volatility_20d')}",
-			"輸出 JSON: {trade_plan:decision, {short, mid, long}, sizing, entries, stops, take_profits, note}.",
+			"輸出 JSON: {trade_plan:decision, last_close, {short, mid, long}, sizing, entries, stops, take_profits, note}.",
 		]
 	)
 	#print(f"[debug] trade content: {content}")
 	return [{"role": "system", "content": "你是交易決策顧問，需落地為具體交易計畫。"}, {"role": "user", "content": content}]
 
 
-def call_openrouter(api_key: str, model: str, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 3500) -> str:
-	headers = {
-		"Authorization": f"Bearer {api_key}",
-		"Content-Type": "application/json",
-	}
-	payload = {
-		"model": model,
-		"messages": messages,
-		"temperature": temperature,
-		"max_tokens": max_tokens,
-	}
-	resp = requests.post(OPENROUTER_ENDPOINT, headers=headers, json=payload, timeout=60)
-	if not resp.ok:
-		raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text}")
-	data = resp.json()
-	try:
-		return data["choices"][0]["message"]["content"]
-	except Exception:
-		raise RuntimeError(f"Unexpected OpenRouter response: {data}")
+def call_openrouter(api_key: str, model: str, messages: List[Dict[str, Any]],
+					temperature: float = 0.7, max_tokens: int = 3500,
+					timeout: int = 60, max_retries: int = 3, backoff_factor: float = 1.0) -> str:
+	"""Call OpenRouter with retries and exponential backoff.
+
+	Raises RuntimeError on unrecoverable errors.
+	"""
+	headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+	payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+
+	for attempt in range(1, max_retries + 1):
+		try:
+			resp = requests.post(OPENROUTER_ENDPOINT, headers=headers, json=payload, timeout=timeout)
+		except requests.exceptions.RequestException as e:
+			if attempt == max_retries:
+				raise RuntimeError(f"OpenRouter request failed after {attempt} attempts: {e}")
+			sleep = backoff_factor * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+			print(f"[llm] request exception: {e}; retrying in {sleep:.1f}s ({attempt}/{max_retries})")
+			time.sleep(sleep)
+			continue
+
+		# Rate limit handling
+		if resp.status_code == 429:
+			retry_after = resp.headers.get("Retry-After")
+			try:
+				wait = float(retry_after) if retry_after is not None else backoff_factor * (2 ** (attempt - 1))
+			except Exception:
+				wait = backoff_factor * (2 ** (attempt - 1))
+			if attempt == max_retries:
+				raise RuntimeError(f"OpenRouter rate limited (429). Response: {resp.text}")
+			print(f"[llm] 429 rate limit, retrying in {wait}s ({attempt}/{max_retries})")
+			time.sleep(wait)
+			continue
+
+		# transient server errors -> retry
+		if 500 <= resp.status_code < 600:
+			if attempt == max_retries:
+				raise RuntimeError(f"OpenRouter server error {resp.status_code}: {resp.text}")
+			sleep = backoff_factor * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+			print(f"[llm] server error {resp.status_code}; retrying in {sleep:.1f}s ({attempt}/{max_retries})")
+			time.sleep(sleep)
+			continue
+
+		if not resp.ok:
+			# client errors (400/401/403) usually not retriable
+			raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text}")
+
+		# try parse JSON (may fail if response ended prematurely)
+		try:
+			data = resp.json()
+		except Exception as e:
+			if attempt == max_retries:
+				raise RuntimeError(f"OpenRouter returned invalid JSON after {attempt} attempts: {e}; text={resp.text[:1000]}")
+			sleep = backoff_factor * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+			print(f"[llm] JSON parse error: {e}; retrying in {sleep:.1f}s ({attempt}/{max_retries})")
+			time.sleep(sleep)
+			continue
+
+		try:
+			return data["choices"][0]["message"]["content"]
+		except Exception as e:
+			if attempt == max_retries:
+				raise RuntimeError(f"Unexpected OpenRouter response structure: {data}")
+			sleep = backoff_factor * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+			print(f"[llm] unexpected response shape: {e}; retrying in {sleep:.1f}s ({attempt}/{max_retries})")
+			time.sleep(sleep)
+			continue
 
 
 def resolve_openrouter_key(explicit_key: Optional[str], config_path: Optional[str]) -> Optional[str]:
@@ -795,22 +923,17 @@ def main():
 		items, missing = assemble_portfolio_items(raw_port, cache_dir, args.openrouter_model)
 		if not items:
 			raise RuntimeError(f"No summaries found for portfolio codes; missing={missing}")
-		#msgs_lite = build_portfolio_lite_messages(items)
-		#print("[llm] calling portfolio lite ...")
-		#text = call_openrouter(api_key, args.openrouter_model, msgs_lite, temperature=args.temperature, max_tokens=args.max_tokens)
-		#print(text)
-		#if notifier.can_send():
-		#	notifier.send(text)
-		#else:
-		#	print("error sending telegram.")
-		# now do full portfolio ranking
 		msgs = build_portfolio_messages(items)
 		cached = load_stage_cache(cache_dir, "portfolio", "portfolio", args.openrouter_model) if "portfolio" in cache_stages else None
 		if cached is not None:
 			text = cached
 		else:
 			print("[llm] calling portfolio ...")
-			text = call_openrouter(api_key, args.openrouter_model, msgs, temperature=args.temperature, max_tokens=args.max_tokens)
+			try:
+				text = call_openrouter(api_key, args.openrouter_model, msgs, temperature=args.temperature, max_tokens=args.max_tokens)
+			except Exception as e:
+				print(f"[llm][error] portfolio call failed: {e}")
+				text = ""
 		try:
 			save_stage_cache(cache_dir, "portfolio", "portfolio", args.openrouter_model, text)
 		except Exception:
@@ -887,7 +1010,11 @@ def main():
 			text = cached
 		else:
 			print(f"[llm] calling stage={stage} ...")
-			text = call_openrouter(api_key, args.openrouter_model, msgs, temperature=args.temperature, max_tokens=args.max_tokens)
+			try:
+				text = call_openrouter(api_key, args.openrouter_model, msgs, temperature=args.temperature, max_tokens=args.max_tokens)
+			except Exception as e:
+				print(f"[llm][error] stage={stage} call failed: {e}")
+				text = ""
 		# Always save stage output to cache directory (user requested saving regardless of load)
 		try:
 			save_stage_cache(cache_dir, args.code, stage, args.openrouter_model, text)
