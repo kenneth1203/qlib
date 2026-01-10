@@ -759,6 +759,46 @@ def build_trade_messages(manager: str, decision_row: Dict[str, Any], price_info:
 	return [{"role": "system", "content": "你是交易決策顧問，需落地為具體交易計畫。"}, {"role": "user", "content": content}]
 
 
+def build_summary_messages(code: str, decision_row: Dict[str, Any], stage_outputs: Dict[str, str], executed: List[str]) -> List[Dict[str, Any]]:
+	"""Build prompt messages to ask the LLM to produce a structured JSON next-day trade plan.
+
+	The messages follow the user's specification: combine technical, fundamental, news, social,
+	bull/bear/manager/trade modules and request a JSON output with decision/confidence/key_reasons/trade_plan/risk_flags.
+	"""
+	# assemble analysis sections
+	parts = []
+	parts.append(f"股票代號: {code}")
+	parts.append("\n--- 以下為分階段報告 (原始 LLM 回覆) ---")
+	for st in executed:
+		txt = stage_outputs.get(st, "")
+		parts.append(f"[{st}]\n{txt}\n")
+
+	user_prompt = "\n".join([
+		"你是一個專業的港股投資分析助手，擅長結合技術面、基本面、新聞情緒、資金面和交易計劃，輸出隔天的交易操作建議。",
+		"請根據下列分階段報告，產出結構化 JSON，欄位如下：",
+		"{",
+		'  "decision": "買入 / 觀望 / 賣出",',
+		'  "confidence": 0.0-1.0,',
+		'  "key_reasons": ["技術面理由","基本面理由","新聞情緒理由","資金面理由"],',
+		'  "trade_plan": {"entry": "建倉條件","add_on": "加倉條件","stop_loss": "止損條件","take_profit": "止盈目標"},',
+		'  "risk_flags": ["主要風險1","主要風險2"]',
+		"}",
+		"要求：",
+		"- JSON 嚴格遵守欄位，回傳純 JSON，不要加額外說明文字。",
+		"- confidence 使用數值 (0 到 1)，越接近 1 表示越有把握。",
+		"- key_reasons 至少包含一條來自技術面與一條來自基本面；若無法判斷請填空字串。",
+		"- trade_plan 的 entry/add_on/stop_loss/take_profit 請用簡短明確條件或價位範圍。",
+		"以下為分階段報告原文：",
+		"\n".join(parts),
+	])
+
+	messages = [
+		{"role": "system", "content": "你是股票投資策略專家，請根據使用者提供的分階段報告，回傳符合規格的 JSON 結果。"},
+		{"role": "user", "content": user_prompt},
+	]
+	return messages
+
+
 def call_openrouter(api_key: str, model: str, messages: List[Dict[str, Any]],
 					temperature: float = 0.7, max_tokens: int = 3500,
 					timeout: int = 60, max_retries: int = 3, backoff_factor: float = 1.0) -> str:
@@ -818,6 +858,10 @@ def call_openrouter(api_key: str, model: str, messages: List[Dict[str, Any]],
 			continue
 
 		try:
+			usage = data.get("usage", {}) 
+			print(f"Prompt tokens: {usage.get('prompt_tokens','N/A')} | "
+				f"Completion tokens: {usage.get('completion_tokens','N/A')} | "
+				f"Total tokens: {usage.get('total_tokens','N/A')}")
 			return data["choices"][0]["message"]["content"]
 		except Exception as e:
 			if attempt == max_retries:
@@ -1023,13 +1067,31 @@ def main():
 			print(f"[cache] warning: failed to save cache for stage={stage}")
 		outputs[stage] = text
 
-	summary = format_summary(args.code, decision_row, outputs, stages)
-	#print(summary)
-	# also save the combined summary to cache for later retrieval
+	# Prepare and save the raw combined textual summary (summary_raw)
+	summary_raw = format_summary(args.code, decision_row, outputs, stages)
 	try:
-		save_stage_cache(cache_dir, args.code, "summary", args.openrouter_model, summary)
+		save_stage_cache(cache_dir, args.code, "summary_raw", args.openrouter_model, summary_raw)
 	except Exception:
-		print("[cache] warning: failed to save summary cache")
+		print("[cache] warning: failed to save summary_raw cache")
+
+	# Build structured summary messages and request a JSON summary from the LLM
+	try:
+		msgs = build_summary_messages(args.code, decision_row, outputs, stages)
+		print("[llm] calling build_summary (structured JSON)")
+		structured = ""
+		try:
+			structured = call_openrouter(api_key, args.openrouter_model, msgs, temperature=args.temperature, max_tokens=args.max_tokens)
+		except Exception as e:
+			print(f"[llm][error] build_summary call failed: {e}")
+		# Save the structured summary as the canonical 'summary' cache
+		try:
+			save_stage_cache(cache_dir, args.code, "summary", args.openrouter_model, structured)
+		except Exception:
+			print("[cache] warning: failed to save structured summary cache")
+		# Optionally overwrite summary variable for downstream usage
+		summary = structured or summary_raw
+	except Exception as e:
+		print(f"[build_summary] failed: {e}")
 
 	tok, chat = resolve_notify_params(args.telegram_token, args.telegram_chat_id, args.notify_config)
 	notifier = TelegramNotifier(tok, chat, parse_mode=None)

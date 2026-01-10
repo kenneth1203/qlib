@@ -1,6 +1,7 @@
 import argparse
 import json
 import time
+from datetime import datetime, timedelta
 import sys
 import random
 from pathlib import Path
@@ -432,7 +433,19 @@ def fetch_all(code: str, force_update: bool = False, max_pages: int = 3, rating_
     if not force_update:
         cached = load_cache(cache_path)
         if cached is not None:
-            return cached
+            try:
+                meta = cached.get("meta", {}) if isinstance(cached, dict) else {}
+                fetched_at = meta.get("fetched_at")
+                if fetched_at:
+                    # expected format: "YYYY-MM-DD HH:MM:SS"
+                    fmt = "%Y-%m-%d %H:%M:%S"
+                    fetched_dt = datetime.strptime(fetched_at, fmt)
+                    if (datetime.now() - fetched_dt) < timedelta(hours=4):
+                        print(f"Using cached data for {display} from {fetched_at}")
+                        return cached
+            except Exception:
+                # on any parsing error, treat cache as stale and continue to fetch
+                pass
     # use base (digits only) for external fetch URLs
     print(f"Fetching company info for {display}...")
     company = fetch_company_info(base)
@@ -488,7 +501,7 @@ def fetch_trending(save_dir: Path = None):
 def main():
     parser = argparse.ArgumentParser(description="Fetch HK stock info/news/finance as JSON")
     parser.add_argument("code", nargs="?", help="HK stock code, e.g., 01810 (optional when --fetch_trending is used)")
-    parser.add_argument("--force_update", action="store_true",default=True, help="Fetch fresh data and overwrite cache")
+    parser.add_argument("--force_update", action="store_true", help="Fetch fresh data and overwrite cache")
     parser.add_argument("--max_pages", type=int, default=3, help="Max news pages to crawl")
     parser.add_argument("--rating_pages", type=int, default=3, help="Max rating pages to crawl")
     parser.add_argument("--sleep_seconds", type=float, default=3.0, help="Sleep between news pages")
