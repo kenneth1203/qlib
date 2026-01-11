@@ -127,7 +127,7 @@ def assemble_portfolio_items(raw_items: List[Any], cache_dir: Path, model: str) 
 	for entry in raw_items:
 		if isinstance(entry, str):
 			code = entry
-			summary = load_stage_cache(cache_dir, code, "summary", model)
+			summary = load_stage_cache(cache_dir, code, "summary_raw", model)
 			if summary is None:
 				missing.append(code)
 				continue
@@ -137,7 +137,7 @@ def assemble_portfolio_items(raw_items: List[Any], cache_dir: Path, model: str) 
 			code = entry.get("code") or entry.get("inst") or entry.get("symbol")
 			if not code:
 				continue
-			summary = entry.get("summary") or load_stage_cache(cache_dir, code, "summary", model)
+			summary = entry.get("summary") or load_stage_cache(cache_dir, code, "summary_raw", model)
 			trade = entry.get("trade") or load_stage_cache(cache_dir, code, "trade", model)
 			if not summary:
 				missing.append(code)
@@ -690,8 +690,8 @@ def build_portfolio_messages(items: List[Dict[str, str]]) -> List[Dict[str, str]
 					"請從每支股票的 summary 抽取技術面、基本面、新聞情緒、bull/bear置信度，輸出綜合排序表 (JSON 格式)。",
 					"股票清單摘要:",
 					"\n".join(lines),
-					"請輸出: JSON {ranking: [{code, company_name_chinese, decision, entry_point, hold_time, take_profit, support_position, stop_loss, rationale, final_score_ranking, score: {tech_score, fundamental_score, valuation_score, sentiment, bull_conf, bear_conf, risk_adjust, total_score}}], top_picks, notes}。",
-					"以上JSON欄位說明包括但不限於：company_name_chinese=於港股巿場中文名稱；decision=買入/觀望/賣出；entry_point=建議進場點;hold_time=建議持倉時間(短中長期)；take_profit=建議止盈點(三階段)；support_position=股價支撐位(多個)；stop_loss=建議止損點；rationale=決策理由摘要；top_picks=首選標的清單；notes=其他說明。",
+					"請輸出: JSON {ranking: [{code, stock_name, decision, entry_point, hold_time, take_profit, support_position, stop_loss, rationale, final_score_ranking, score: {tech_score, fundamental_score, valuation_score, sentiment, bull_conf, bear_conf, risk_adjust, total_score}}], top_picks, notes}。",
+					"以上JSON欄位說明包括但不限於：stock_name=於港股巿場中文名稱；decision=買入/觀望/賣出；entry_point=建議進場點;hold_time=建議持倉時間(短中長期)；take_profit=建議止盈點(三階段)；support_position=股價支撐位(多個)；stop_loss=建議止損點；rationale=決策理由摘要；top_picks=首選標的清單；notes=其他說明。",
 				]
 			),
 		},
@@ -777,6 +777,8 @@ def build_summary_messages(code: str, decision_row: Dict[str, Any], stage_output
 		"你是一個專業的港股投資分析助手，擅長結合技術面、基本面、新聞情緒、資金面和交易計劃，輸出隔天的交易操作建議。",
 		"請根據下列分階段報告，產出結構化 JSON，欄位如下：",
 		"{",
+		'  "stock_code": "股票代碼",', 
+		'  "stock_name": "中文名稱",',
 		'  "decision": "買入 / 觀望 / 賣出",',
 		'  "confidence": 0.0-1.0,',
 		'  "key_reasons": ["技術面理由","基本面理由","新聞情緒理由","資金面理由"],',
@@ -801,7 +803,7 @@ def build_summary_messages(code: str, decision_row: Dict[str, Any], stage_output
 
 def call_openrouter(api_key: str, model: str, messages: List[Dict[str, Any]],
 					temperature: float = 0.7, max_tokens: int = 3500,
-					timeout: int = 60, max_retries: int = 3, backoff_factor: float = 1.0) -> str:
+					timeout: int = 60, max_retries: int = 3, backoff_factor: float = 3.0) -> str:
 	"""Call OpenRouter with retries and exponential backoff.
 
 	Raises RuntimeError on unrecoverable errors.
@@ -810,6 +812,7 @@ def call_openrouter(api_key: str, model: str, messages: List[Dict[str, Any]],
 	payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
 
 	for attempt in range(1, max_retries + 1):
+		headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 		try:
 			resp = requests.post(OPENROUTER_ENDPOINT, headers=headers, json=payload, timeout=timeout)
 		except requests.exceptions.RequestException as e:
@@ -842,8 +845,28 @@ def call_openrouter(api_key: str, model: str, messages: List[Dict[str, Any]],
 			time.sleep(sleep)
 			continue
 
+		# Special-case 401: sometimes transient even when Authorization header present.
+		if resp.status_code == 401:
+			# try to extract OpenRouter error message
+			try:
+				err_json = resp.json()
+				err_msg = err_json.get("error", {}).get("message") if isinstance(err_json, dict) else None
+			except Exception:
+				err_msg = None
+			if not err_msg:
+				err_msg = resp.text
+			auth_present = bool(headers.get("Authorization"))
+			diag = f"OpenRouter 401: {err_msg}; Authorization header present={auth_present}"
+			if attempt == max_retries:
+				raise RuntimeError(diag)
+			# treat as transient: sleep and retry
+			sleep = backoff_factor * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+			print(f"[llm] 401 Unauthorized, retrying in {sleep:.1f}s ({attempt}/{max_retries}): {err_msg}")
+			time.sleep(sleep)
+			continue
+
 		if not resp.ok:
-			# client errors (400/401/403) usually not retriable
+			# other client errors (400/403 etc.) usually not retriable
 			raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text}")
 
 		# try parse JSON (may fail if response ended prematurely)
