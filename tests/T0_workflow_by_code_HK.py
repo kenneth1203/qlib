@@ -54,9 +54,9 @@ HK_GBDT_TASK = {
                 },
             },
             "segments": {
-                "train": ("2005-01-01", "2019-12-31"),   # ✅ 15 年訓練
-                "valid": ("2020-01-01", "2021-12-31"),   # ✅ 2 年驗證
-                "test":  ("2022-01-01", "2025-12-17")    # ✅ 4 年測試
+                "train": ("2005-01-01", "2018-12-31"),   # ✅ 15 年訓練
+                "valid": ("2019-01-01", "2020-12-31"),   # ✅ 2 年驗證
+                "test":  ("2021-01-01", "2025-12-17")    # ✅ 4 年測試
             },
         },
     },
@@ -177,7 +177,7 @@ if __name__ == "__main__":
         factor_map = (qlib.config.C.trade_unit / bl).rename("$factor")
 
         # Build extra_quote with $close, $volume, and $factor for backtest date range
-        start, end = "2022-01-01", _last_trading_day
+        start, end = "2021-01-01", _last_trading_day
         base = D.features(
             factor_map.index.tolist(),
             ["$close", "$volume"],
@@ -219,7 +219,7 @@ if __name__ == "__main__":
             },
         },
         "backtest": {
-            "start_time": "2022-01-01",   # ✅ 與 test 對齊
+            "start_time": "2021-01-01",   # ✅ 與 test 對齊
             "end_time":   "2025-12-17",   # ✅ 與 test 對齊
             "account": 10000000,
             "benchmark": HK_BENCH,

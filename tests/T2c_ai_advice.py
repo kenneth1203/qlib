@@ -545,11 +545,11 @@ def build_technical_messages(code: str, decision_row: Dict[str, Any], price_info
 		f" | MACD({macd_str})"
 		f" | KDJ({kdj_str})"
 	)
-	recent_lines = _recent_ohlcv_lines(price_info, days=180)
+	recent_lines = _recent_ohlcv_lines(price_info, days=360)
 	msg = [
 		{
 			"role": "system",
-			"content": "你是股票市場技術分析師，聚焦K線形態、技術指標、趨勢結構、超賣超買、支撐阻力、動能分析、量價結構、風險點，並給出買賣時機初步判斷。",
+			"content": "你是股票市場技術分析師，聚焦K線形態、缠论分析、技術指標、趨勢結構、超賣超買、支撐阻力、動能分析、量價結構、風險點，並給出買賣時機初步判斷。",
 		},
 		{"role": "system", "content": scoring},
 		{
@@ -561,11 +561,68 @@ def build_technical_messages(code: str, decision_row: Dict[str, Any], price_info
 					f"價格摘要: {price_summary}",
 					"最近180日OHLCV:" if recent_lines else "",
 					"\n".join(recent_lines),
-					"請輸出 JSON: {technical_report, signals, risk, final_score_ranking}. signals 包含買/賣/觀望和理由。",
+					"請嚴格輸出 JSON，符合以下 schema，不要包含額外文字或解釋：",
+					"""{
+					"technical_report": {
+						"trend_analysis": {
+						"short_term": "string",
+						"medium_term": "string",
+						"long_term": "string",
+						"key_levels": {
+							"support": ["string"],
+							"resistance": ["string"]
+						}
+						},
+						"momentum_indicators": {
+						"RSI": "string",
+						"MACD": "string",
+						"ATR": "string"
+						},
+						"volume_analysis": {
+						"recent_pattern": "string",
+						"key_anomaly": "string"
+						},
+						"pattern_recognition": {
+						"candlestick": "string",
+						"price_structure": "string"
+						},
+						"chanlun_analysis": {
+						"short_term_cycle": "string, 缠论短期趨勢判斷",
+						"medium_term_cycle": "string, 缠论中期趨勢判斷",
+						"long_term_cycle": "string, 缠论長期趨勢判斷",
+						"turning_points": ["string, 是否存在轉折點及位置描述"],
+						"buy_sell_points": {
+							"yi_buy": "boolean, 是否出現一買",
+							"yi_sell": "boolean, 是否出現一賣",
+							"er_buy": "boolean, 是否出現二買",
+							"er_sell": "boolean, 是否出現二賣",
+							"san_buy": "boolean, 是否出現三買",
+							"san_sell": "boolean, 是否出現三賣",
+							"explanation": "string, 出現或未出現的理由"
+							}
+						}
+					},
+					"signals": {
+						"primary": "buy|sell|hold|觀望",
+						"reasons": ["string"],
+						"contingency_plan": {
+						"buy_trigger": "string",
+						"sell_trigger": "string"
+						}
+					},
+					"risk": {
+						"market_risk": "string",
+						"liquidity_risk": "string",
+						"event_risk": ["string"],
+						"stop_loss": "string"
+					},
+					"final_score_ranking": "integer"
+					}"""
 				]
 			),
 		},
 	]
+
 	#print(f"[debug] technical messages: {msg}")
 	return msg
 
@@ -681,7 +738,10 @@ def build_portfolio_messages(items: List[Dict[str, str]]) -> List[Dict[str, str]
 		"排序邏輯: 先對每檔打短期技術信號分、中期基本面改善分、長期估值空間分，再做風險調整(波動、流動性、負面事件)，並結合 bull/bear 置信度。"
 	)
 	msg = [
-		{"role": "system", "content": "你是投資組合評審員，根據多支股票的摘要做綜合排序並輸出JSON格式，使用繁體中文，不要刪減任何一支股票。"},
+		{
+			"role": "system",
+			"content": "你是投資組合評審員，根據多支股票的摘要做綜合排序並輸出JSON格式，使用繁體中文，不要刪減任何一支股票。"
+		},
 		{
 			"role": "user",
 			"content": "\n".join(
@@ -690,12 +750,58 @@ def build_portfolio_messages(items: List[Dict[str, str]]) -> List[Dict[str, str]
 					"請從每支股票的 summary 抽取技術面、基本面、新聞情緒、bull/bear置信度，輸出綜合排序表 (JSON 格式)。",
 					"股票清單摘要:",
 					"\n".join(lines),
-					"請輸出: JSON {ranking: [{code, stock_name, decision, entry_point, hold_time, take_profit, support_position, stop_loss, rationale, final_score_ranking, score: {tech_score, fundamental_score, valuation_score, sentiment, bull_conf, bear_conf, risk_adjust, total_score}}], top_picks, notes}。",
-					"以上JSON欄位說明包括但不限於：stock_name=於港股巿場中文名稱；decision=買入/觀望/賣出；entry_point=建議進場點;hold_time=建議持倉時間(短中長期)；take_profit=建議止盈點(三階段)；support_position=股價支撐位(多個)；stop_loss=建議止損點；rationale=決策理由摘要；top_picks=首選標的清單；notes=其他說明。",
+					"""請輸出: JSON {
+						ranking: [{
+							code,
+							stock_name,
+							decision,
+							entry_point,
+							take_profit,
+							trade_plan,
+							support_position,
+							stop_loss,
+							key_reasons,
+							time_horizon,
+							volatility_profile,
+							liquidity_profile,
+							catalyst_window,
+							risk_flags,
+							final_score_ranking,
+							score: {
+							tech_score,
+							fundamental_score,
+							valuation_score,
+							sentiment,
+							bull_conf,
+							bear_conf,
+							risk_adjust,
+							total_score
+							},
+							chanlun_analysis: {
+							short_term_cycle: "string, 缠论短期趨勢判斷",
+							medium_term_cycle: "string, 缠论中期趨勢判斷",
+							long_term_cycle: "string, 缠论長期趨勢判斷",
+							turning_points: ["string, 是否存在轉折點及位置描述"],
+							buy_sell_points: {
+								yi_buy: "boolean, 是否出現一買",
+								yi_sell: "boolean, 是否出現一賣",
+								er_buy: "boolean, 是否出現二買",
+								er_sell: "boolean, 是否出現二賣",
+								san_buy: "boolean, 是否出現三買",
+								san_sell: "boolean, 是否出現三賣",
+								explanation: "string, 出現或未出現的理由"
+							}
+							}
+						}],
+						top_picks,
+						notes
+						}""",
+					"以上JSON欄位說明包括但不限於：stock_name=於港股巿場中文名稱；decision=買入/觀望/賣出；entry_point=建議進場點;trade_plan=進場/加倉/止損/止盈條件；take_profit=建議止盈點(三階段)；support_position=股價支撐位(多個)；stop_loss=建議止損點；volatility_profile=高/中/低；liquidity_profile=高/中/低；catalyst_window=即時/事件驅動/長期結構性；time_horizon=日內/短期(1-5天)/中期(1-3個月)/長期(6個月以上)；risk_flags=主要風險；key_reasons=決策理由摘要,至少包含技術面與基本面理由；chanlun_analysis=缠论趨勢與123買賣點判斷；top_picks=首選標的清單；notes=其他說明。"
 				]
 			),
 		},
 	]
+
 	#print(f"[debug] portfolio messages: {msg}")
 	return msg
 
@@ -774,7 +880,7 @@ def build_summary_messages(code: str, decision_row: Dict[str, Any], stage_output
 		parts.append(f"[{st}]\n{txt}\n")
 
 	user_prompt = "\n".join([
-		"你是一個專業的港股投資分析助手，擅長結合技術面、基本面、新聞情緒、資金面和交易計劃，輸出隔天的交易操作建議。",
+		"你是一個專業的港股投資分析助手，擅長結合技術面(包括缠论分析)、基本面、新聞情緒、資金面和交易計劃，輸出隔天的交易操作建議。",
 		"請根據下列分階段報告，產出結構化 JSON，欄位如下：",
 		"{",
 		'  "stock_code": "股票代碼",', 
@@ -782,8 +888,13 @@ def build_summary_messages(code: str, decision_row: Dict[str, Any], stage_output
 		'  "decision": "買入 / 觀望 / 賣出",',
 		'  "confidence": 0.0-1.0,',
 		'  "key_reasons": ["技術面理由","基本面理由","新聞情緒理由","資金面理由"],',
+		'  "chanlun_analysis":總結缠论分析結果,及出現的一買/二買/三買/一賣/二賣/三賣等買賣點,',
 		'  "trade_plan": {"entry": "建倉條件","add_on": "加倉條件","stop_loss": "止損條件","take_profit": "止盈目標"},',
 		'  "risk_flags": ["主要風險1","主要風險2"]',
+		'  "time_horizon": "日內 / 短期(1-5天) / 中期(1-3個月) / 長期(6個月以上)",',
+		'  "volatility_profile": "高 / 中 / 低",',
+		'  "liquidity_profile": "高 / 中 / 低",',
+		'  "catalyst_window": "即時 / 事件驅動 / 長期結構性"',
 		"}",
 		"要求：",
 		"- JSON 嚴格遵守欄位，回傳純 JSON，不要加額外說明文字。",

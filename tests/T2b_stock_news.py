@@ -511,9 +511,9 @@ def main():
     parser.add_argument("--backoff", type=float, default=0.5, help="Exponential backoff factor between retries")
     parser.add_argument("--fetch_trending", action="store_true", help="Also fetch trending news categories and save to cache")
     parser.add_argument(
-        "--test_fetch",
+        "--single_fetch",
         choices=["company", "finance", "dividends", "rights", "ratings", "news"],
-        help="Run only a single fetch (no cache) and print the JSON result",
+        help="Single-section fetch: run only one fetch (no cache) and print the JSON",
     )
     args = parser.parse_args()
 
@@ -522,23 +522,23 @@ def main():
     REQUEST_TIMEOUT = (args.timeout_connect, args.timeout_read)
     init_session(retries=args.retries, backoff=args.backoff)
 
-    # Single-fetch test mode: run one fetch and print JSON, then exit.
-    if args.test_fetch:
+    # Single-section fetch mode: run one fetch and print JSON, then exit.
+    if args.single_fetch:
         if not args.code:
-            parser.error("`code` is required for --test_fetch")
+            parser.error("`code` is required for --single_fetch")
         base_digits = ''.join([c for c in str(args.code) if c.isdigit()])
         base = base_digits.zfill(5)
-        if args.test_fetch == "company":
+        if args.single_fetch == "company":
             res = fetch_company_info(base)
-        elif args.test_fetch == "finance":
+        elif args.single_fetch == "finance":
             res = fetch_financial_indicators(base)
-        elif args.test_fetch == "dividends":
+        elif args.single_fetch == "dividends":
             res = fetch_dividends(base)
-        elif args.test_fetch == "rights":
+        elif args.single_fetch == "rights":
             res = fetch_rights_changes(base)
-        elif args.test_fetch == "ratings":
+        elif args.single_fetch == "ratings":
             res = fetch_ratings(base, pages=args.rating_pages, sleep_seconds=args.sleep_seconds)
-        elif args.test_fetch == "news":
+        elif args.single_fetch == "news":
             res = fetch_news_pages(base, max_pages=args.max_pages, sleep_seconds=args.sleep_seconds)
         else:
             res = None

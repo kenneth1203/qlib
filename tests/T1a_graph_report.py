@@ -59,7 +59,7 @@ if __name__ == "__main__":
 
     dataset = init_instance_by_config(HK_GBDT_TASK["dataset"])
 
-    recorder = R.get_recorder(recorder_id="050590db3b4f47239180b6f83d16ca7e", experiment_name="workflow")
+    recorder = R.get_recorder(recorder_id="3e3febba13ee43d4bf40cd27122b96cc", experiment_name="workflow")
     print(recorder)
     pred_df = recorder.load_object("pred.pkl")
     report_normal_df = recorder.load_object("portfolio_analysis/report_normal_1day.pkl")
