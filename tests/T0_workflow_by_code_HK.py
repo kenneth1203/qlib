@@ -145,8 +145,8 @@ if __name__ == "__main__":
     # --- Liquidity filter: reuse helper for consistent universe ---
     handler_kwargs = HK_GBDT_TASK["dataset"]["kwargs"]["handler"]["kwargs"]
     keep_insts, info = compute_liquid_instruments(
-        liq_threshold=60_000_000,
-        liq_window=20,
+        liq_threshold=30_000_000,
+        liq_window=60,
         handler_end_time=handler_kwargs.get("end_time", None),
     )
     print(f"Liquidity filter: kept {info['kept_count']} / {info['orig_count']} instruments ({info['pct']:.2f}%)")

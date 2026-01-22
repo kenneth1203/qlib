@@ -877,8 +877,8 @@ if __name__ == "__main__":
     parser.add_argument("--provider_uri", default="~/.qlib/qlib_data/hk_data", help="qlib data dir")
     parser.add_argument("--topk", type=int, default=20, help="number of instruments to score")
     parser.add_argument("--lookback", type=int, default=365, help="lookback days for indicators")
-    parser.add_argument("--liq_threshold", type=float, default=60000000.0, help="avg dollar vol gate")
-    parser.add_argument("--liq_window", type=int, default=20, help="window for avg dollar vol")
+    parser.add_argument("--liq_threshold", type=float, default=30000000.0, help="avg dollar vol gate")
+    parser.add_argument("--liq_window", type=int, default=60, help="window for avg dollar vol")
     parser.add_argument("--allow_partial", action="store_true", help="allow partial scoring for insufficient-history instruments (skip missing indicators instead of penalizing)")
     parser.add_argument("--final_threshold", type=float, default=2.0, help="minimum final_score threshold for buy filter")
     # Kronos options
