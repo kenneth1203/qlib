@@ -41,6 +41,8 @@ class BaseCollector(abc.ABC):
         check_data_length: int = None,
         limit_nums: int = None,
         symbols: [str, Iterable[str]] = None,
+        update_mode: str = None,
+        **kwargs,
     ):
         """
 
@@ -74,6 +76,8 @@ class BaseCollector(abc.ABC):
         self.mini_symbol_map = {}
         self.interval = interval
         self.check_data_length = max(int(check_data_length) if check_data_length is not None else 0, 0)
+        # Flag to indicate which flow invoked the collector (e.g. update_data_to_bin)
+        self.update_mode = update_mode
 
         # optional explicit symbol list (string with commas or iterable)
         self.symbols = None

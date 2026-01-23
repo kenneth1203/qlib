@@ -174,8 +174,7 @@ if __name__ == "__main__":
             dtype={"instrument": str},
         )
         bl = bl.set_index("instrument")["board_lot"].astype(float)
-        factor_map = (qlib.config.C.trade_unit / bl).rename("$factor")
-
+        factor_map = (bl / qlib.config.C.trade_unit).rename("$factor")
         # Build extra_quote with $close, $volume, and $factor for backtest date range
         start, end = "2021-01-01", _last_trading_day
         base = D.features(

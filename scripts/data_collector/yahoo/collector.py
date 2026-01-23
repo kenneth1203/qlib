@@ -64,6 +64,8 @@ class YahooCollector(BaseCollector):
         check_data_length: int = None,
         limit_nums: int = None,
         symbols: [str, Iterable[str]] = None,
+        update_mode: str = None,
+        **kwargs,
     ):
         """
 
@@ -99,6 +101,8 @@ class YahooCollector(BaseCollector):
             check_data_length=check_data_length,
             limit_nums=limit_nums,
             symbols=symbols,
+            update_mode=update_mode,
+            **kwargs,
         )
 
         self.init_datetime()
@@ -298,6 +302,30 @@ class YahooCollectorUS1min(YahooCollectorUS):
 
 
 class YahooCollectorHK(YahooCollector, ABC):
+    def __init__(
+        self,
+        *args,
+        update_mode: str = None,
+        futu_host: str = "127.0.0.1",
+        futu_port: int = 11111,
+        **kwargs,
+    ):
+        # keep host/port lightweight to avoid pickle issues when running in parallel
+        self.futu_host = futu_host or "127.0.0.1"
+        try:
+            self.futu_port = int(futu_port) if futu_port is not None else 11111
+        except Exception:
+            self.futu_port = 11111
+        # detect whether we are running via update_data_to_bin flow
+        self.use_futu_snapshot = str(update_mode).lower() == "update_data_to_bin"
+        self._futu_snapshot_cache = None
+        super().__init__(*args, update_mode=update_mode, **kwargs)
+        if self.use_futu_snapshot:
+            # futu snapshot is single-request; no need for inter-symbol sleep
+            self.delay = 0
+        if self.use_futu_snapshot and self.interval == self.INTERVAL_1d:
+            self._prefetch_futu_snapshot()
+
     def get_instrument_list(self):
         logger.info("get HK stock symbols......")
         symbols = get_hk_stock_symbols()
@@ -305,22 +333,10 @@ class YahooCollectorHK(YahooCollector, ABC):
         return symbols
 
     def download_index_data(self):
-        # Download HSI (^HSI) and save as 800000.HK.csv so normalize/dump can treat it as benchmark
-        try:
-            logger.info("get HSI (^HSI) data......")
-            _start = self.start_datetime.strftime("%Y-%m-%d")
-            _end = self.end_datetime.strftime("%Y-%m-%d")
-            resp = Ticker("^HSI", asynchronous=False).history(interval="1d", start=_start, end=_end)
-            if isinstance(resp, pd.DataFrame) and not resp.empty:
-                df = resp.reset_index()
-                # Normalize date column to YYYY-MM-DD if present
-                if "date" in df.columns:
-                    df["date"] = df["date"].astype(str).str[:10]
-                # Ensure adjclose exists for later adjustment logic
-                if "adjclose" not in df.columns:
-                    if "close" in df.columns:
-                        df["adjclose"] = df["close"]
-                df["symbol"] = "800000.HK"
+        # Prefer futu snapshot when running update_data_to_bin; fall back to Yahoo query otherwise
+        if self.use_futu_snapshot and self.interval == self.INTERVAL_1d:
+            df = self._get_futu_row("800000.HK", fetch_if_missing=True)
+            if df is not None and not df.empty:
                 _path = self.save_dir.joinpath("800000.HK.csv")
                 try:
                     if _path.exists():
@@ -329,11 +345,10 @@ class YahooCollectorHK(YahooCollector, ABC):
                 except Exception:
                     logger.warning(f"Failed to read existing HSI CSV at {_path}; will overwrite")
                 df.to_csv(_path, index=False)
-                logger.info(f"Saved HSI to {_path}")
-            else:
-                logger.warning("No HSI data fetched from Yahoo for given date range")
-        except Exception as e:
-            logger.warning(f"Failed to fetch HSI (^HSI): {e}")
+                logger.info(f"Saved HSI snapshot from Futu to {_path}")
+                return
+            logger.warning("Futu snapshot unavailable for HSI; fallback to Yahoo query")
+        self._download_index_data_via_yahoo()
 
     def normalize_symbol(self, symbol):
         s = str(symbol).strip()
@@ -399,6 +414,133 @@ class YahooCollectorHK(YahooCollector, ABC):
 
         # none succeeded
         return None
+
+    def _download_index_data_via_yahoo(self):
+        # Download HSI (^HSI) and save as 800000.HK.csv so normalize/dump can treat it as benchmark
+        try:
+            logger.info("get HSI (^HSI) data......")
+            _start = self.start_datetime.strftime("%Y-%m-%d")
+            _end = self.end_datetime.strftime("%Y-%m-%d")
+            resp = Ticker("^HSI", asynchronous=False).history(interval="1d", start=_start, end=_end)
+            if isinstance(resp, pd.DataFrame) and not resp.empty:
+                df = resp.reset_index()
+                if "date" in df.columns:
+                    df["date"] = df["date"].astype(str).str[:10]
+                if "adjclose" not in df.columns and "close" in df.columns:
+                    df["adjclose"] = df["close"]
+                df["symbol"] = "800000.HK"
+                _path = self.save_dir.joinpath("800000.HK.csv")
+                try:
+                    if _path.exists():
+                        _old_df = pd.read_csv(_path)
+                        df = pd.concat([_old_df, df], sort=False)
+                except Exception:
+                    logger.warning(f"Failed to read existing HSI CSV at {_path}; will overwrite")
+                df.to_csv(_path, index=False)
+                logger.info(f"Saved HSI to {_path}")
+            else:
+                logger.warning("No HSI data fetched from Yahoo for given date range")
+        except Exception as e:
+            logger.warning(f"Failed to fetch HSI (^HSI): {e}")
+
+    @staticmethod
+    def _to_futu_code(symbol: str) -> str:
+        s = str(symbol).replace("HK.", "").replace(".HK", "").strip()
+        if not s:
+            return None
+        if not s.isdigit():
+            return None
+        return f"HK.{s.zfill(5)}"
+
+    @staticmethod
+    def _from_futu_code(code: str) -> str:
+        c = str(code).upper().replace("HK.", "").replace(".HK", "").strip()
+        if not c:
+            return None
+        return f"{c.zfill(5)}.HK"
+
+    def _fetch_futu_snapshot(self, symbols):
+        try:
+            from futu import OpenQuoteContext, RET_OK
+        except Exception as e:
+            logger.warning(f"Futu API not available: {e}")
+            return None
+        futu_codes = [self._to_futu_code(s) for s in symbols if self._to_futu_code(s)]
+        if not futu_codes:
+            return None
+        frames = []
+        for i in range(0, len(futu_codes), 400):
+            batch = futu_codes[i : i + 400]
+            try:
+                ctx = OpenQuoteContext(host=self.futu_host, port=self.futu_port)
+            except Exception as e:
+                logger.warning(f"Failed to open Futu OpenD connection: {e}")
+                return None
+            try:
+                ret, data = ctx.get_market_snapshot(batch)
+            finally:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+            if ret != RET_OK:
+                logger.warning(f"Futu snapshot request failed for batch starting {batch[0]}: {data}")
+                return None
+            frames.append(data)
+        if not frames:
+            return None
+        raw_df = pd.concat(frames, ignore_index=True)
+        if raw_df.empty:
+            return None
+        df = pd.DataFrame()
+        df["symbol"] = raw_df["code"].apply(self._from_futu_code)
+        df["date"] = pd.to_datetime(raw_df["update_time"], errors="coerce").dt.strftime("%Y-%m-%d")
+        df["open"] = raw_df.get("open_price")
+        df["close"] = raw_df.get("last_price")
+        df["high"] = raw_df.get("high_price")
+        df["low"] = raw_df.get("low_price")
+        df["volume"] = pd.to_numeric(raw_df.get("volume"), errors="coerce")
+        df["adjclose"] = df["close"]
+        df = df.dropna(subset=["symbol"]).reset_index(drop=True)
+        return df
+
+    def _prefetch_futu_snapshot(self):
+        try:
+            symbols = list(set(self.instrument_list + ["800000.HK"]))
+        except Exception:
+            symbols = ["800000.HK"]
+        df = self._fetch_futu_snapshot(symbols)
+        if df is not None and not df.empty:
+            self._futu_snapshot_cache = df
+            logger.info(f"Loaded {len(df)} symbols from Futu snapshot for update_data_to_bin")
+        else:
+            logger.warning("Futu snapshot prefetch failed; will fallback to Yahoo per-symbol")
+
+    def _get_futu_row(self, symbol: str, fetch_if_missing: bool = False):
+        if self._futu_snapshot_cache is not None:
+            _mask = self._futu_snapshot_cache["symbol"] == self.normalize_symbol(symbol)
+            if _mask.any():
+                return self._futu_snapshot_cache[_mask].copy()
+        if fetch_if_missing:
+            df = self._fetch_futu_snapshot([symbol])
+            if df is not None and not df.empty:
+                return df
+        return None
+
+    def get_data(
+        self, symbol: str, interval: str, start_datetime: pd.Timestamp, end_datetime: pd.Timestamp
+    ) -> pd.DataFrame:
+        if self.use_futu_snapshot and interval == self.INTERVAL_1d:
+            df = self._get_futu_row(symbol, fetch_if_missing=True)
+            if df is not None and not df.empty:
+                try:
+                    df_ts = pd.to_datetime(df["date"], errors="coerce")
+                    df = df[(df_ts >= pd.to_datetime(start_datetime)) & (df_ts < pd.to_datetime(end_datetime))]
+                except Exception:
+                    pass
+                if not df.empty:
+                    return df.reset_index(drop=True)
+        return super(YahooCollectorHK, self).get_data(symbol, interval, start_datetime, end_datetime)
 
     @property
     def _timezone(self):
@@ -996,6 +1138,7 @@ class Run(BaseRun):
         check_data_length=None,
         limit_nums=None,
         symbols: str = None,
+        **kwargs,
     ):
         """download data from Internet
 
@@ -1031,7 +1174,16 @@ class Run(BaseRun):
         #if self.interval == "1d" and pd.Timestamp(end) > pd.Timestamp(datetime.datetime.now().strftime("%Y-%m-%d")):
             #raise ValueError(f"end_date: {end} is greater than the current date.")
 
-        super(Run, self).download_data(max_collector_count, delay, start, end, check_data_length, limit_nums, symbols=symbols)
+        super(Run, self).download_data(
+            max_collector_count,
+            delay,
+            start,
+            end,
+            check_data_length,
+            limit_nums,
+            symbols=symbols,
+            **kwargs,
+        )
 
     def normalize_data(
         self,
@@ -1267,7 +1419,13 @@ class Run(BaseRun):
         # download data from yahoo (can be skipped via flag)
         # NOTE: when downloading data from YahooFinance, max_workers is recommended to be 1
         if not skip_download:
-            self.download_data(delay=delay, start=trading_date, end=end_date, check_data_length=check_data_length)
+            self.download_data(
+                delay=delay,
+                start=trading_date,
+                end=end_date,
+                check_data_length=check_data_length,
+                update_mode="update_data_to_bin",
+            )
         else:
             logger.info(
                 f"skip_download=True: reusing existing raw source files in {Path(self.source_dir).expanduser()}"
