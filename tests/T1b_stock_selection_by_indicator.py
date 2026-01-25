@@ -4,12 +4,15 @@
 - Applies liquidity and listing filters (defaults: liq_threshold=30_000_000 HKD, liq_window=60, min_listing_days=120).
 - Loads a trained model from a recorder, predicts for the latest trading day, ranks by score.
 - Applies top-k (default 200) BEFORE indicator filters.
-- Computes two technical indicators (translated from provided Futu custom formulas):
-  * indicator1 (EMA momentum cross >0 within last N bars)
-  * indicator2 (Guanding composite buy triggers within last N bars)
-- Keeps stocks where indicator1 or indicator2 is true in the last lookback window (default 3 bars) and exports a CSV.
+- Computes four technical indicators (translated from provided Futu custom formulas):
+    * indicator1 (EMA momentum cross >0 within last N bars)
+    * indicator2 (Guanding composite buy triggers within last N bars)
+    * indicator3 (main line crosses big line & big<50 within last N bars)
+-  * indicator4 (FORCAST tower COND3 trigger within last N bars)
+- When evaluating indicators, requires weekly trend flag (ATR channel) to be uptrend.
+- Keeps stocks where any indicator is true in the last lookback window (default 3 bars) and exports a CSV.
 
-Output CSV columns: code, chinese_name, indicator1, indicator2, score
+Output CSV columns: code, chinese_name, indicator1, indicator2, indicator3, indicator4, score, indicator dates
 """
 import argparse
 import copy
@@ -149,6 +152,38 @@ def _ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 
+def _sma_cn(series: pd.Series, n: int) -> pd.Series:
+    """Chinese SMA(X,N,1) == Wilder smoothing with alpha=1/N."""
+    return series.ewm(alpha=1.0 / float(n), adjust=False).mean()
+
+
+def _forecast(series: pd.Series, n: int) -> pd.Series:
+    """TongDaXin FORCAST approximation: rolling linear regression fitted value at last point of window.
+
+    For each rolling window of length n on `series`, fit y ~ a + b*x with x=0..n-1,
+    then return y_hat at x=n-1 (last point in the window).
+    """
+    if n <= 1:
+        return series.astype(float)
+    s = series.astype(float)
+    x = np.arange(n, dtype=float)
+    sum_x = x.sum()
+    sum_x2 = (x ** 2).sum()
+    denom = n * sum_x2 - (sum_x ** 2)
+    if denom == 0:
+        return s
+
+    def _linreg_last(y: np.ndarray) -> float:
+        sum_y = float(np.sum(y))
+        sum_xy = float(np.dot(x, y))
+        b = (n * sum_xy - sum_x * sum_y) / denom
+        a = (sum_y - b * sum_x) / n
+        return a + b * (n - 1)
+
+    out = s.rolling(window=n, min_periods=n).apply(lambda arr: _linreg_last(arr), raw=True)
+    return out
+
+
 def indicator1_signal(df: pd.DataFrame, lookback: int = 3) -> bool:
     """庄家抬轿翻譯: VAR1=EMA(EMA(close,9),9); VAR2=(VAR1-REF(VAR1,1))/REF(VAR1,1)*1000; signal if VAR2 crosses above 0 within lookback bars."""
     close = df["close"].astype(float)
@@ -203,6 +238,179 @@ def indicator2_triggers(df: pd.DataFrame) -> pd.Series:
     d3 = ema(d2, 5)
     bbuy = (d2 > d3) & (d2.shift(1) <= d3.shift(1))
     return bbuy
+
+
+def indicator3_triggers(df: pd.DataFrame) -> pd.Series:
+    """ATR-based long/short wave buy point: COND = CROSS(main, big) & big < 50.
+    main = D + 100 where D = EMA(R, 4), R = -100*(HHV(H,34)-C)/(HHV(H,34)-LLV(L,34))
+    big  = A + 100 where A = MA(R, 19)
+    """
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+
+    hhv34 = high.rolling(window=34, min_periods=1).max()
+    llv34 = low.rolling(window=34, min_periods=1).min()
+    denom34 = (hhv34 - llv34).replace(0, np.nan)
+    r = -100 * (hhv34 - close) / denom34
+
+    a = r.rolling(window=19, min_periods=1).mean()  # MA with simple mean
+    d = r.ewm(span=4, adjust=False).mean()
+    big = a + 100
+    main = d + 100
+
+    cross = (main > big) & (main.shift(1) <= big.shift(1))
+    cond = cross & (big < 50)
+    return cond
+
+
+def indicator4_triggers(df: pd.DataFrame) -> pd.Series:
+    """FORCAST tower structure trigger: COND3 = COND1 AND COND2_.
+
+    Steps:
+      FAi = FORCAST(EMA(CLOSE, {5,8,11,14,17}), 6)
+      FB = FA1 + FA2 + FA3 + FA4 - 4*FA5
+      TOWERC = EMA(FB, 2)
+      FCAST_FLAG = TOWERC >= REF(TOWERC,1)
+      COND1 = FCAST_FLAG & NOT(REF(FCAST_FLAG,1))
+      PERIOD_COND1 = BARSLAST(REF(COND1,1))
+      COND2_ = CLOSE < REF(CLOSE, PERIOD_COND1+1) & TOWERC > REF(TOWERC, PERIOD_COND1+1)
+      COND3 = COND1 & COND2_
+    """
+    if df.empty:
+        return pd.Series(dtype=bool)
+    close = df["close"].astype(float)
+    # FA components
+    fa1 = _forecast(_ema(close, 5), 6)
+    fa2 = _forecast(_ema(close, 8), 6)
+    fa3 = _forecast(_ema(close, 11), 6)
+    fa4 = _forecast(_ema(close, 14), 6)
+    fa5 = _forecast(_ema(close, 17), 6)
+    fb = fa1 + fa2 + fa3 + fa4 - 4.0 * fa5
+    towerc = _ema(fb, 2)
+
+    fcast_flag = (towerc >= towerc.shift(1)).astype("boolean")
+    cond1 = fcast_flag & (~fcast_flag.shift(1).astype("boolean").fillna(False))
+    cond1_prev = cond1.shift(1).astype("boolean").fillna(False)
+
+    # PERIOD_COND1 = bars since last True of cond1_prev
+    period_vals = []
+    last_true_idx = None
+    idx = cond1_prev.index
+    for i in range(len(cond1_prev)):
+        if bool(cond1_prev.iloc[i]):
+            last_true_idx = i
+            period_vals.append(0)
+        else:
+            if last_true_idx is None:
+                period_vals.append(np.nan)
+            else:
+                period_vals.append(i - last_true_idx)
+    period = pd.Series(period_vals, index=idx)
+
+    # COND2_ with variable historical offset
+    cond2_vals = []
+    for i in range(len(close)):
+        p = period.iloc[i]
+        if pd.isna(p):
+            cond2_vals.append(False)
+            continue
+        k = int(p) + 1
+        j = i - k
+        if j < 0:
+            cond2_vals.append(False)
+            continue
+        cond2_vals.append((close.iloc[i] < close.iloc[j]) and (towerc.iloc[i] > towerc.iloc[j]))
+    cond2 = pd.Series(cond2_vals, index=close.index)
+
+    cond3 = cond1 & cond2
+    return cond3.fillna(False)
+
+
+def trend_up_weekly_flag(df: pd.DataFrame, length: int = 22, mult: float = 3.0) -> pd.Series:
+    """Compute weekly ATR-channel trend flag and broadcast to daily index as uptrend mask.
+
+    Formula (weekly):
+        TR = max(H-L, abs(H-REF(C,1)), abs(L-REF(C,1)))
+        ATR1 = SMA(TR, LENGTH, 1)
+        A1 = HHV(CLOSE, LENGTH) - MULT*ATR1
+        B1 = LLV(CLOSE, LENGTH) + MULT*ATR1
+        A4 = HHV(A1, BARSLAST(NOT(REF(CLOSE,1)>REF(A1,1)))+1)   # running max resets when cond fails
+        B4 = LLV(B1, BARSLAST(NOT(REF(CLOSE,1)<REF(B1,1)))+1)   # running min resets when cond fails
+        FLAG = 1 if CLOSE>REF(B4,1); -1 if CLOSE<REF(A4,1); else 0
+        FLAG1 = FLAG if FLAG!=0 else REF(FLAG, BARSLAST(NOT(FLAG=0)))
+        UPTREND = FLAG1==1
+    Returned Series is aligned to daily index (ffill from weekly values).
+    """
+    if df.empty:
+        return pd.Series(False, index=df.index)
+
+    # resample to weekly (Friday) for trend computation
+    df_week = df.resample("W-FRI").agg({"close": "last", "high": "max", "low": "min"}).dropna()
+    if df_week.empty:
+        return pd.Series(False, index=df.index)
+
+    close_w = df_week["close"].astype(float)
+    high_w = df_week["high"].astype(float)
+    low_w = df_week["low"].astype(float)
+
+    prev_close = close_w.shift(1)
+    tr = pd.concat([(high_w - low_w), (high_w - prev_close).abs(), (low_w - prev_close).abs()], axis=1).max(axis=1)
+    atr1 = _sma_cn(tr, length)
+    a1 = close_w.rolling(length, min_periods=1).max() - mult * atr1
+    b1 = close_w.rolling(length, min_periods=1).min() + mult * atr1
+
+    a4_list = []
+    b4_list = []
+    last_high = np.nan
+    last_low = np.nan
+    for i in range(len(close_w)):
+        a1_i = a1.iloc[i]
+        b1_i = b1.iloc[i]
+        if i == 0:
+            last_high = a1_i
+            last_low = b1_i
+        else:
+            cp_prev = close_w.iloc[i - 1]
+            a1_prev = a1.iloc[i - 1]
+            b1_prev = b1.iloc[i - 1]
+            if not (cp_prev > a1_prev):
+                last_high = a1_i
+            else:
+                last_high = max(last_high, a1_i)
+            if not (cp_prev < b1_prev):
+                last_low = b1_i
+            else:
+                last_low = min(last_low, b1_i)
+        a4_list.append(last_high)
+        b4_list.append(last_low)
+    a4 = pd.Series(a4_list, index=close_w.index)
+    b4 = pd.Series(b4_list, index=close_w.index)
+
+    flag_list = []
+    last_nonzero = None
+    for i in range(len(close_w)):
+        c = close_w.iloc[i]
+        a4_prev = a4.iloc[i - 1] if i > 0 else np.nan
+        b4_prev = b4.iloc[i - 1] if i > 0 else np.nan
+        f = 0
+        if not np.isnan(b4_prev) and c > b4_prev:
+            f = 1
+        elif not np.isnan(a4_prev) and c < a4_prev:
+            f = -1
+        else:
+            f = 0
+        if f != 0:
+            last_nonzero = f
+            flag_list.append(f)
+        else:
+            flag_list.append(last_nonzero if last_nonzero is not None else 0)
+    flag1 = pd.Series(flag_list, index=close_w.index)
+
+    up_week = (flag1 == 1).astype("boolean")
+    up_daily = up_week.reindex(df.index, method="ffill")
+    up_daily = up_daily.fillna(False)
+    return up_daily.astype(bool)
 
 
 def latest_trigger_date(triggers: pd.Series, lookback: int) -> Optional[pd.Timestamp]:
@@ -325,40 +533,45 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days, liq
         except Exception:
             sub = ohlcv[ohlcv.get("instrument") == inst_str] if "instrument" in ohlcv.columns else pd.DataFrame()
         if sub.empty:
-            ind1 = ind2 = False
-            d1 = d2 = None
+            ind1 = ind2 = ind3 = False
+            d1 = d2 = d3 = None
         else:
             # ensure sorted by date
             sub = sub.sort_index()
-            tr1 = indicator1_triggers(sub)
-            tr2 = indicator2_triggers(sub)
+            uptrend = trend_up_weekly_flag(sub)
+            tr1 = indicator1_triggers(sub) & uptrend
+            tr2 = indicator2_triggers(sub) & uptrend
+            tr3 = indicator3_triggers(sub) & uptrend
+            tr4 = indicator4_triggers(sub)  # indicator4 does not require uptrend gate
             ind1 = bool(tr1.tail(indicator_lookback).any())
             ind2 = bool(tr2.tail(indicator_lookback).any())
+            ind3 = bool(tr3.tail(indicator_lookback).any())
+            ind4 = bool(tr4.tail(indicator_lookback).any())
             d1 = latest_trigger_date(tr1, indicator_lookback)
             d2 = latest_trigger_date(tr2, indicator_lookback)
+            d3 = latest_trigger_date(tr3, indicator_lookback)
+            d4 = latest_trigger_date(tr4, indicator_lookback)
         latest_dt = None
-        if d1 is not None and d2 is not None:
-            latest_dt = max(d1, d2)
-        elif d1 is not None:
-            latest_dt = d1
-        elif d2 is not None:
-            latest_dt = d2
-        indicator_pass.append((inst_str, ind1, ind2, float(score), d1, d2, latest_dt))
+        dates = [d for d in (d1, d2, d3, d4) if d is not None]
+        if dates:
+            latest_dt = max(dates)
+        indicator_pass.append((inst_str, ind1, ind2, ind3, ind4, float(score), d1, d2, d3, d4, latest_dt))
 
     # keep those passing either indicator
-    selected = [(c, s, i1, i2, d1, d2, ldt) for (c, i1, i2, s, d1, d2, ldt) in indicator_pass if i1 or i2]
+    selected = [(c, s, i1, i2, i3, i4, d1, d2, d3, d4, ldt) for (c, i1, i2, i3, i4, s, d1, d2, d3, d4, ldt) in indicator_pass if (i1 or i2 or i3 or i4)]
 
-    # sort: first prioritize both indicators true, then by model score; ignore date
+    # sort: prioritize (indicator1 & indicator2) first, then indicator3, then score
     def sort_key(item):
-        code, score, i1, i2, d1, d2, ldt = item
-        both = 1 if (i1 and i2) else 0
-        return (both, float(score))
+        code, score, i1, i2, i3, i4, d1, d2, d3, d4, ldt = item
+        both12 = 1 if (i1 and i2) else 0
+        has34 = 1 if (i3 or i4) else 0
+        return (both12, has34, float(score))
     selected = sorted(selected, key=sort_key, reverse=True)
 
     # build table for stdout
     if selected:
         table_rows = []
-        for code, score, i1, i2, d1, d2, ldt in selected:
+        for code, score, i1, i2, i3, i4, d1, d2, d3, d4, ldt in selected:
             mk = code.split(".", 1)[0].zfill(5) + ".hk"
             name = resolve_chinese(code, mapping)
             table_rows.append({
@@ -367,25 +580,29 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days, liq
                 "score": score,
                 "indicator1": i1,
                 "indicator2": i2,
+                "indicator3": i3,
+                "indicator4": i4,
                 "latest_date": (ldt.strftime("%Y-%m-%d") if isinstance(ldt, pd.Timestamp) else "")
             })
         df_view = pd.DataFrame(table_rows)
         df_view["_score_s"] = df_view["score"].map(lambda x: f"{x:.6f}")
-        cols = ["id", "name", "_score_s", "indicator1", "indicator2", "latest_date"]
+        cols = ["id", "name", "_score_s", "indicator1", "indicator2", "indicator3", "indicator4", "latest_date"]
         widths = {c: max(_disp_width(c), int(df_view[c].map(lambda v: _disp_width(v)).max())) for c in cols}
-        hdr = f"{_pad_right('id', widths['id'])}  {_pad_right('name', widths['name'])}  {_pad_left('score', widths['_score_s'])}  {_pad_left('indicator1', widths['indicator1'])}  {_pad_left('indicator2', widths['indicator2'])}  {_pad_right('latest_date', widths['latest_date'])}"
+        hdr = f"{_pad_right('id', widths['id'])}  {_pad_right('name', widths['name'])}  {_pad_left('score', widths['_score_s'])}  {_pad_left('indicator1', widths['indicator1'])}  {_pad_left('indicator2', widths['indicator2'])}  {_pad_left('indicator3', widths['indicator3'])}  {_pad_left('indicator4', widths['indicator4'])}  {_pad_right('latest_date', widths['latest_date'])}"
         print("\nSelected (indicator OR):")
         print(hdr)
         for _, r in df_view.iterrows():
-            row_s = f"{_pad_right(r['id'], widths['id'])}  {_pad_right(r['name'], widths['name'])}  {_pad_left(r['_score_s'], widths['_score_s'])}  {_pad_left(str(r['indicator1']), widths['indicator1'])}  {_pad_left(str(r['indicator2']), widths['indicator2'])}  {_pad_right(r['latest_date'], widths['latest_date'])}"
+            row_s = f"{_pad_right(r['id'], widths['id'])}  {_pad_right(r['name'], widths['name'])}  {_pad_left(r['_score_s'], widths['_score_s'])}  {_pad_left(str(r['indicator1']), widths['indicator1'])}  {_pad_left(str(r['indicator2']), widths['indicator2'])}  {_pad_left(str(r['indicator3']), widths['indicator3'])}  {_pad_left(str(r['indicator4']), widths['indicator4'])}  {_pad_right(r['latest_date'], widths['latest_date'])}"
             print(row_s)
 
     # export CSV
     day_str = pd.to_datetime(target_day).strftime("%Y%m%d")
     out_csv = output_csv or f"t1b_selection_{day_str}_{recorder_id}.csv"
     export_rows = []
-    for code, ind1, ind2, score, d1, d2, ldt in indicator_pass:
-        if not (ind1 or ind2):
+    for code, ind1, ind2, ind3, ind4, score, d1, d2, d3, d4, ldt in indicator_pass:
+        if float(score) < 0:
+            continue
+        if not (ind1 or ind2 or ind3 or ind4):
             continue
         mk = code.split(".", 1)[0].zfill(5) + ".hk"
         name = resolve_chinese(code, mapping)
@@ -394,17 +611,22 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days, liq
             "chinese_name": name,
             "indicator1": bool(ind1),
             "indicator2": bool(ind2),
+            "indicator3": bool(ind3),
+            "indicator4": bool(ind4),
             "indicator1_date": (d1.strftime("%Y-%m-%d") if isinstance(d1, pd.Timestamp) else ""),
             "indicator2_date": (d2.strftime("%Y-%m-%d") if isinstance(d2, pd.Timestamp) else ""),
+            "indicator3_date": (d3.strftime("%Y-%m-%d") if isinstance(d3, pd.Timestamp) else ""),
+            "indicator4_date": (d4.strftime("%Y-%m-%d") if isinstance(d4, pd.Timestamp) else ""),
             "latest_indicator_date": (ldt.strftime("%Y-%m-%d") if isinstance(ldt, pd.Timestamp) else ""),
             "score": float(score)
         })
-    # sort export rows: prioritize both indicators true, then by score
+    # sort export rows: prioritize (indicator1 & indicator2), then (indicator3 or indicator4), then score
     if export_rows:
         export_rows = sorted(
             export_rows,
             key=lambda r: (
                 1 if (bool(r.get("indicator1")) and bool(r.get("indicator2"))) else 0,
+                1 if (bool(r.get("indicator3")) or bool(r.get("indicator4"))) else 0,
                 float(r["score"]),
             ),
             reverse=True,
@@ -440,12 +662,12 @@ if __name__ == "__main__":
     parser.add_argument("--recorder_id", default=None, help="recorder/run id (run id). If omitted, use latest run folder under ./mlruns")
     parser.add_argument("--experiment_name", default="workflow", help="experiment name")
     parser.add_argument("--provider_uri", default="~/.qlib/qlib_data/hk_data", help="qlib data dir")
-    parser.add_argument("--topk", type=int, default=300, help="apply top-k BEFORE indicator filters")
+    parser.add_argument("--topk", type=int, default=400, help="apply top-k BEFORE indicator filters")
     parser.add_argument("--min_listing_days", type=int, default=120, help="minimum trading days since listing; set 0 to disable filter")
     parser.add_argument("--liq_threshold", type=float, default=30_000_000, help="HKD liquidity threshold")
     parser.add_argument("--liq_window", type=int, default=60, help="liquidity window (days)")
     parser.add_argument("--indicator_lookback", type=int, default=3, help="bars to look back for indicator triggers")
-    parser.add_argument("--lookback_days", type=int, default=250, help="override OHLCV history length (days)")
+    parser.add_argument("--lookback_days", type=int, default=300, help="override OHLCV history length (days)")
     parser.add_argument("--output_csv", help="output CSV path; default t1b_selection_<date>_<recorder_id>.csv")
     parser.add_argument("--telegram_token", help="telegram bot token (optional)")
     parser.add_argument("--telegram_chat_id", help="telegram chat id (optional)")
