@@ -75,7 +75,37 @@ def compute_liquid_instruments(liq_threshold=1_000_000, liq_window=20, handler_e
     handler_end_time : str or pd.Timestamp, optional
         End time for the feature pull; falls back to today if None.
     """
+    # Prefer the shared filter implementation in T0b_stock_filter for consistency.
+    try:
+        from qlib.tests import T0b_stock_filter as stock_filter  # type: ignore
 
+        try:
+            from qlib.config import C
+            _provider_uri = getattr(C, "provider_uri", None)
+        except Exception:
+            _provider_uri = None
+
+        all_insts = D.instruments("all")
+        keep_insts, info = stock_filter.filter_instruments_by_conditions(
+            instruments=all_insts,
+            target_day=handler_end_time,
+            provider_uri=_provider_uri or "~/.qlib/qlib_data/hk_data",
+            min_avg_amount=liq_threshold,
+            avg_amount_window=liq_window,
+            auto_init=_provider_uri is None,
+        )
+        if "kept_count" not in info:
+            info = {
+                **info,
+                "orig_count": len(all_insts),
+                "kept_count": len(keep_insts),
+                "pct": (len(keep_insts) / max(1, len(all_insts))) * 100,
+            }
+        return keep_insts, info
+    except Exception:
+        pass
+
+    # Fallback to legacy rolling dollar-volume implementation if the shared filter is unavailable.
     all_insts = D.instruments("all")
 
     end_time = handler_end_time or pd.Timestamp.today().strftime("%Y-%m-%d")
@@ -142,15 +172,34 @@ if __name__ == "__main__":
     # keep a module-scoped name for later use (extra_quote / backtest override)
     _last_trading_day = last_day
 
-    # --- Liquidity filter: reuse helper for consistent universe ---
+    # --- Liquidity filter: use T0b_stock_filter (amount + turnover) ---
     handler_kwargs = HK_GBDT_TASK["dataset"]["kwargs"]["handler"]["kwargs"]
-    keep_insts, info = compute_liquid_instruments(
-        liq_threshold=30_000_000,
-        liq_window=60,
-        handler_end_time=handler_kwargs.get("end_time", None),
-    )
-    print(f"Liquidity filter: kept {info['kept_count']} / {info['orig_count']} instruments ({info['pct']:.2f}%)")
-    print("Sample kept instruments:", info["sample"])
+    try:
+        from qlib.tests import T0b_stock_filter as stock_filter  # type: ignore
+
+        keep_insts, info = stock_filter.filter_instruments_by_conditions(
+            instruments=D.instruments("all"),
+            target_day=handler_kwargs.get("end_time", None),
+            provider_uri=provider_uri,
+            min_avg_amount=3_000_000,
+            avg_amount_window=60,
+            min_turnover=0.001,
+            auto_init=False,
+        )
+        print(
+            f"Liquidity filter (T0b): kept {info['kept_count']} / {info['orig_count']} instruments ({info['pct']:.2f}%)"
+        )
+        print("Sample kept instruments:", info.get("sample", []))
+    except Exception:
+        keep_insts, info = compute_liquid_instruments(
+            liq_threshold=30_000_000,
+            liq_window=60,
+            handler_end_time=handler_kwargs.get("end_time", None),
+        )
+        print(
+            f"Liquidity filter (fallback): kept {info['kept_count']} / {info['orig_count']} instruments ({info['pct']:.2f}%)"
+        )
+        print("Sample kept instruments:", info["sample"])
 
     if len(keep_insts) == 0:
         import warnings

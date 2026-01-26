@@ -115,13 +115,33 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
         except Exception:
             pass
         liq_window = 60
-        keep_insts, info = hkmod.compute_liquid_instruments(
-            liq_threshold=30_000_000,
-            liq_window=liq_window,
-            handler_end_time=hkw.get("end_time", None),
-        )
-        print(f"Liquidity filter (predict): kept {info['kept_count']} / {info['orig_count']} instruments ({info['pct']:.2f}%)")
-        print("Sample kept instruments:", info["sample"])
+        try:
+            from qlib.tests import T0b_stock_filter as stock_filter  # type: ignore
+
+            keep_insts, info = stock_filter.filter_instruments_by_conditions(
+                instruments=D.instruments("all"),
+                target_day=hkw.get("end_time", None),
+                provider_uri=provider_uri,
+                min_avg_amount=3_000_000,
+                avg_amount_window=liq_window,
+                min_turnover=0.001,
+                auto_init=False,
+            )
+            print(
+                f"Liquidity filter (predict, T0b): kept {info['kept_count']} / {info['orig_count']} instruments ({info['pct']:.2f}%)"
+            )
+            print("Sample kept instruments:", info.get("sample", []))
+        except Exception:
+            keep_insts, info = hkmod.compute_liquid_instruments(
+                liq_threshold=30_000_000,
+                liq_window=liq_window,
+                handler_end_time=hkw.get("end_time", None),
+            )
+            print(
+                f"Liquidity filter (predict, fallback): kept {info['kept_count']} / {info['orig_count']} instruments ({info['pct']:.2f}%)"
+            )
+            print("Sample kept instruments:", info.get("sample", []))
+
         if len(keep_insts) > 0:
             hkw["instruments"] = keep_insts
 
