@@ -277,8 +277,6 @@ if __name__ == "__main__":
                 "macd_fast": 12,
                 "macd_slow": 26,
                 "macd_signal": 9,
-                "macd_lookback_days": 200,
-                "indicator_csv": os.path.abspath(os.path.join(os.getcwd(), "instrument_filtered.csv")),
                 "only_tradable": True,
                 "forbid_all_trade_at_limit": True
             },

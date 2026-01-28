@@ -337,6 +337,7 @@ class Position(BasePosition):
         self.position[stock_id] = {}
         self.position[stock_id]["amount"] = amount
         self.position[stock_id]["price"] = price
+        self.position[stock_id]["buy_price"] = price
         self.position[stock_id]["weight"] = 0  # update the weight in the end of the trade date
 
     def _buy_stock(self, stock_id: str, trade_val: float, cost: float, trade_price: float) -> None:
@@ -344,8 +345,15 @@ class Position(BasePosition):
         if stock_id not in self.position:
             self._init_stock(stock_id=stock_id, amount=trade_amount, price=trade_price)
         else:
-            # exist, add amount
-            self.position[stock_id]["amount"] += trade_amount
+            # exist, add amount and update average buy price
+            old_amount = self.position[stock_id]["amount"]
+            new_amount = old_amount + trade_amount
+            old_buy_price = self.position[stock_id].get("buy_price", None)
+            if old_buy_price is not None and trade_price is not None and new_amount > 0:
+                self.position[stock_id]["buy_price"] = (old_buy_price * old_amount + trade_price * trade_amount) / new_amount
+            elif trade_price is not None:
+                self.position[stock_id]["buy_price"] = trade_price
+            self.position[stock_id]["amount"] = new_amount
 
         self.position["cash"] -= trade_val + cost
 

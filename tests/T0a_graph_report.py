@@ -98,6 +98,7 @@ if __name__ == "__main__":
 
     # Top50 most profitable stocks (approx by position value change)
     pos_figs = []
+    trade_df = pd.DataFrame()
     try:
         pos_obj = positions
         # normalize positions into a MultiIndex DataFrame
@@ -175,7 +176,6 @@ if __name__ == "__main__":
                 except Exception:
                     close_wide = None
 
-            results = []
             trade_rows = []
             if value_df is not None and not value_df.empty:
                 for inst in value_df.columns:
@@ -189,25 +189,13 @@ if __name__ == "__main__":
                     enters = (hold_mask.astype(int).diff().fillna(hold_mask.astype(int)) == 1).sum()
                     start_val = float(series.loc[first_idx]) if first_idx in series.index else float("nan")
                     end_val = float(series.loc[last_idx]) if last_idx in series.index else float("nan")
-                    profit_amt = end_val - start_val if pd.notna(start_val) and pd.notna(end_val) else float("nan")
-                    profit_rate = (profit_amt / start_val) if (pd.notna(profit_amt) and start_val not in (0, float("nan"))) else float("nan")
-                    results.append(
-                        {
-                            "instrument": inst,
-                            "first_buy": first_idx,
-                            "last_sell": last_idx,
-                            "trades": int(enters),
-                            "profit_rate": profit_rate,
-                            "profit_amt": profit_amt,
-                        }
-                    )
-
                     # reconstruct simple round-trip trades by holding intervals
                     diff = hold_mask.astype(int).diff().fillna(hold_mask.astype(int))
                     starts = diff[diff == 1].index.tolist()
                     ends = diff[diff == -1].index.tolist()
                     if hold_mask.iloc[0]:
-                        starts = [hold_mask.index[0]] + starts
+                        if not starts or starts[0] != hold_mask.index[0]:
+                            starts = [hold_mask.index[0]] + starts
                     if len(ends) < len(starts):
                         ends = ends + [hold_mask.index[-1]]
                     for s_dt, e_dt in zip(starts, ends):
@@ -220,6 +208,7 @@ if __name__ == "__main__":
                         sell_px = None
                         vol_amt = None
                         pnl = e_val - s_val
+                        cost = None
                         rate = float("nan")
                         try:
                             if close_wide is not None and s_dt in close_wide.index and inst in close_wide.columns:
@@ -240,6 +229,7 @@ if __name__ == "__main__":
                             rate = (pnl / cost) if cost else float("nan")
                         else:
                             if s_val not in (0, float("nan")):
+                                cost = abs(s_val)
                                 rate = (pnl / s_val) if s_val else float("nan")
                         trade_rows.append(
                             {
@@ -251,39 +241,77 @@ if __name__ == "__main__":
                                 "buy_price": buy_px,
                                 "sell_price": sell_px,
                                 "volume": vol_amt,
+                                "cost": cost,
                             }
                         )
-
-            if results:
-                res_df = pd.DataFrame(results)
-                res_df = res_df.sort_values("profit_amt", ascending=False).head(50)
-                fig_table = go.Figure(
-                    data=[
-                        go.Table(
-                            header=dict(values=["Rank", "股票", "最初買入時間", "最後賣出時間", "中間交易次數", "最終獲利率", "最終獲利金額"], fill_color="lightgrey"),
-                            cells=dict(
-                                values=[
-                                    (res_df.index + 1).tolist(),
-                                    res_df["instrument"].tolist(),
-                                    [str(v) for v in res_df["first_buy"]],
-                                    [str(v) for v in res_df["last_sell"]],
-                                    res_df["trades"].tolist(),
-                                    [f"{x:.2%}" if pd.notna(x) else "" for x in res_df["profit_rate"]],
-                                    [f"{x:,.0f}" for x in res_df["profit_amt"]],
-                                ]
-                            ),
-                        )
-                    ]
-                )
-                fig_table.update_layout(title="Top50 最賺錢股票", height=720)
-                pos_figs = [fig_table]
 
             if trade_rows:
                 trade_df = pd.DataFrame(trade_rows)
 
+                # Top50 most profitable stocks by summing trade PnL
+                try:
+                    grp = trade_df.groupby("instrument", dropna=True)
+                    res_df = grp.agg(
+                        first_buy=("buy_time", "min"),
+                        last_sell=("sell_time", "max"),
+                        trades=("instrument", "count"),
+                        profit_amt=("profit_amt", "sum"),
+                        total_cost=("cost", "sum"),
+                    ).reset_index()
+                    res_df["profit_rate"] = res_df.apply(
+                        lambda r: (r["profit_amt"] / r["total_cost"]) if r["total_cost"] else float("nan"),
+                        axis=1,
+                    )
+                    res_df = res_df.sort_values("profit_amt", ascending=False).head(50)
+                    fig_table = go.Figure(
+                        data=[
+                            go.Table(
+                                header=dict(values=["Rank", "股票", "最初買入時間", "最後賣出時間", "中間交易次數", "最終獲利率", "最終獲利金額"], fill_color="lightgrey"),
+                                cells=dict(
+                                    values=[
+                                        (res_df.index + 1).tolist(),
+                                        res_df["instrument"].tolist(),
+                                        [str(v) for v in res_df["first_buy"]],
+                                        [str(v) for v in res_df["last_sell"]],
+                                        res_df["trades"].tolist(),
+                                        [f"{x:.2%}" if pd.notna(x) else "" for x in res_df["profit_rate"]],
+                                        [f"{x:,.0f}" for x in res_df["profit_amt"]],
+                                    ]
+                                ),
+                            )
+                        ]
+                    )
+                    fig_table.update_layout(title="Top50 最賺錢股票", height=720)
+                    pos_figs = [fig_table]
+
+                    # Top50 most losing stocks by summing trade PnL
+                    res_df_loss = res_df.sort_values("profit_amt", ascending=True).head(50)
+                    fig_table_loss = go.Figure(
+                        data=[
+                            go.Table(
+                                header=dict(values=["Rank", "股票", "最初買入時間", "最後賣出時間", "中間交易次數", "最終獲利率", "最終獲利金額"], fill_color="lightgrey"),
+                                cells=dict(
+                                    values=[
+                                        (res_df_loss.index + 1).tolist(),
+                                        res_df_loss["instrument"].tolist(),
+                                        [str(v) for v in res_df_loss["first_buy"]],
+                                        [str(v) for v in res_df_loss["last_sell"]],
+                                        res_df_loss["trades"].tolist(),
+                                        [f"{x:.2%}" if pd.notna(x) else "" for x in res_df_loss["profit_rate"]],
+                                        [f"{x:,.0f}" for x in res_df_loss["profit_amt"]],
+                                    ]
+                                ),
+                            )
+                        ]
+                    )
+                    fig_table_loss.update_layout(title="Top50 最虧錢股票", height=720)
+                    pos_figs = list(pos_figs) + [fig_table_loss]
+                except Exception:
+                    pass
+
                 # Full trade history for the single most profitable stock
                 try:
-                    if results:
+                    if "res_df" in locals() and not res_df.empty:
                         top_stock = res_df.iloc[0]["instrument"]
                         top_trades = trade_df[trade_df["instrument"] == top_stock].copy()
                         if not top_trades.empty:
@@ -467,6 +495,38 @@ if __name__ == "__main__":
     except Exception:
         account_figs = []
 
+    # trade win/loss summary table
+    winloss_figs = []
+    try:
+        total_trades = int(len(trade_df)) if isinstance(trade_df, pd.DataFrame) else 0
+        if total_trades > 0 and "profit_amt" in trade_df.columns:
+            win_cnt = int((trade_df["profit_amt"] > 0).sum())
+            loss_cnt = int((trade_df["profit_amt"] < 0).sum())
+        else:
+            win_cnt = 0
+            loss_cnt = 0
+        win_rate = (win_cnt / total_trades) if total_trades else 0.0
+        avg_daily_trades = 0.0
+        try:
+            if total_trades > 0 and "buy_time" in trade_df.columns:
+                buy_dates = pd.to_datetime(trade_df["buy_time"], errors="coerce").dt.normalize()
+                day_count = int(buy_dates.dropna().nunique())
+                avg_daily_trades = (total_trades / day_count) if day_count > 0 else 0.0
+        except Exception:
+            avg_daily_trades = 0.0
+        fig_winloss = go.Figure(
+            data=[
+                go.Table(
+                    header=dict(values=["總交易次數", "賺錢交易次數", "虧錢交易次數", "勝率", "平均每日交易次數"], fill_color="lightgrey"),
+                    cells=dict(values=[[total_trades], [win_cnt], [loss_cnt], [f"{win_rate:.2%}"], [f"{avg_daily_trades:.2f}"]]),
+                )
+            ]
+        )
+        fig_winloss.update_layout(title="交易勝率摘要", height=240)
+        winloss_figs = [fig_winloss]
+    except Exception:
+        winloss_figs = []
+
 
     label_df = dataset.prepare("test", col_set="label")
     label_df.columns = ["label"]
@@ -475,7 +535,7 @@ if __name__ == "__main__":
     perf_figs = analysis_model.model_performance_graph(pred_label, show_notebook=False) or []
 
     # Combine all generated figures into a single HTML file (account first)
-    all_figs = list(account_figs) + list(figs) + list(pos_figs) + list(top_hold_figs) + list(risk_figs) + list(ic_figs) + list(perf_figs)
+    all_figs = list(account_figs) + list(winloss_figs) + list(figs) + list(pos_figs) + list(top_hold_figs) + list(risk_figs) + list(ic_figs) + list(perf_figs)
     fragments = []
     out_dir = os.getcwd()
     for i, fig in enumerate(all_figs):
@@ -486,7 +546,9 @@ if __name__ == "__main__":
             frag = pio.to_html(fig, include_plotlyjs=False, full_html=False)
         fragments.append(f"<div id=\"figure_{i}\">{frag}</div>")
 
-    combined_html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Combined Report</title></head><body>"
+    combined_html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Combined Report</title>"
+    combined_html += "<style>body, table, th, td, div { user-select: text; -webkit-user-select: text; -ms-user-select: text; }</style>"
+    combined_html += "</head><body>"
     combined_html += "\n<hr/>\n".join(fragments)
     combined_html += "</body></html>"
 

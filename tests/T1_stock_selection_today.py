@@ -316,7 +316,7 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                 if cand_insts:
                     feat = D.features(
                         cand_insts,
-                        ["$DIF", "$DEA", "$DIF_PREV", "$DEA_PREV"],
+                        ["$DIF", "$DEA", "$DIF_PREV", "$DEA_PREV", "$KDJ_K", "$KDJ_D"],
                         start_time=target_day,
                         end_time=target_day,
                         freq="day",
@@ -329,14 +329,32 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                                 dea = float(row.get("$DEA")) if "$DEA" in row else None
                                 dif_prev = float(row.get("$DIF_PREV")) if "$DIF_PREV" in row else None
                                 dea_prev = float(row.get("$DEA_PREV")) if "$DEA_PREV" in row else None
+                                kdj_k = float(row.get("$KDJ_K")) if "$KDJ_K" in row else None
+                                kdj_d = float(row.get("$KDJ_D")) if "$KDJ_D" in row else None
                             except Exception:
-                                dif = dea = dif_prev = dea_prev = None
+                                dif = dea = dif_prev = dea_prev = kdj_k = kdj_d = None
                             if None in (dif, dea, dif_prev, dea_prev):
                                 continue
                             if dif > dea and dif > 0:
                                 bullish_set.add(inst)
                                 if dif_prev <= dea_prev:
                                     golden_set.add(inst)
+                            # KDJ golden cross (use prev from *_PREV if available; fallback to current only)
+                            if kdj_k is not None and kdj_d is not None:
+                                # Try to infer prev from current batch if present
+                                kdj_k_prev = None
+                                kdj_d_prev = None
+                                try:
+                                    if len(sub) >= 2:
+                                        prev_row = sub.droplevel(0).iloc[-2]
+                                        kdj_k_prev = float(prev_row.get("$KDJ_K")) if "$KDJ_K" in prev_row else None
+                                        kdj_d_prev = float(prev_row.get("$KDJ_D")) if "$KDJ_D" in prev_row else None
+                                except Exception:
+                                    kdj_k_prev = kdj_d_prev = None
+                                if kdj_k_prev is not None and kdj_d_prev is not None:
+                                    if dif is not None and dif > 0:
+                                        if kdj_k_prev <= kdj_d_prev and kdj_k > kdj_d:
+                                            golden_set.add(inst)
             except Exception:
                 bullish_set = set()
                 golden_set = set()
@@ -416,21 +434,32 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
     except Exception:
         print("Prediction result:", pred)
 
-    # save selected list locally (dated file) and keep legacy name for compatibility
-    pred = selected if "selected" in locals() else pred
+    # save model prediction in original format (do not overwrite with selected list)
+    pred_orig = pred
     day_str = pd.to_datetime(target_day).strftime("%Y%m%d")
     out_dated = f"pred_{day_str}_{recorder_id}.pkl"
     with open(out_dated, "wb") as f:
-        pickle.dump(pred, f)
+        pickle.dump(pred_orig, f)
     print(f"Saved prediction to {out_dated}")
 
-    out_legacy = f"pred_today_{recorder_id}.pkl"
+    # save selected list to CSV with id, name, score
     try:
-        with open(out_legacy, "wb") as f:
-            pickle.dump(pred, f)
-        print(f"Saved legacy prediction to {out_legacy}")
+        if "selected" in locals() and "score_df" in locals():
+            rows_csv = []
+            for inst in selected:
+                try:
+                    score_val = float(score_df.loc[inst, "score"]) if inst in score_df.index else 0.0
+                except Exception:
+                    score_val = 0.0
+                mk = inst.split(".", 1)[0].zfill(5) + ".hk"
+                name = resolve_chinese(inst, mapping) if "mapping" in locals() else ""
+                rows_csv.append({"id": mk, "name": name, "score": score_val})
+            sel_df = pd.DataFrame(rows_csv)
+            sel_path = f"selection_{day_str}_{recorder_id}.csv"
+            sel_df.to_csv(sel_path, index=False, encoding="utf-8-sig")
+            print(f"Saved selection CSV to {sel_path}")
     except Exception as e:
-        print(f"Warning: failed to write legacy pred file {out_legacy}: {e}")
+        print(f"Warning: failed to write selection CSV: {e}")
 
     if notifier:
         preview = ", ".join(selected) if 'selected' in locals() else ""

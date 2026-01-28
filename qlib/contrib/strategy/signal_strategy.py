@@ -313,85 +313,244 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         macd_fast: int = 12,
         macd_slow: int = 26,
         macd_signal: int = 9,
-        macd_lookback_days: int = 200,
-        indicator_csv: Optional[str] = None,
+        rsi_overbought: float = 70.0,
+        kdj_overbought: float = 80.0,
+        kdj_oversold: float = 20.0,
+        #stop_loss_pct: float = 0.10,
+        stop_loss_pct: Optional[float] = None,
+        min_turnover: float = 0.001,
+        #min_turnover: Optional[float] = None,
+        allow_missing_shares: bool = True,
         **kwargs,
     ):
         super().__init__(topk=topk, n_drop=n_drop, **kwargs)
         self.macd_fast = macd_fast
         self.macd_slow = macd_slow
         self.macd_signal = macd_signal
-        self.macd_lookback_days = macd_lookback_days
-        # indicator_csv is deprecated here; we always read from bin features
-        self.indicator_csv = None
-        self._indicator_df: Optional[pd.DataFrame] = None
+        self.rsi_overbought = rsi_overbought
+        self.kdj_overbought = kdj_overbought
+        self.kdj_oversold = kdj_oversold
+        self.stop_loss_pct = stop_loss_pct
+        self.min_turnover = min_turnover
+        self.allow_missing_shares = allow_missing_shares
+        self._macd_feat_cache: Optional[pd.DataFrame] = None
+        self._macd_cache_insts: Set[str] = set()
+        self._macd_cache_start: Optional[pd.Timestamp] = None
+        self._macd_cache_end: Optional[pd.Timestamp] = None
+        self._issued_shares: Optional[pd.Series] = None
+        self._issued_shares_loaded: bool = False
+        self._turnover_cache: Dict[pd.Timestamp, pd.Series] = {}
+
+    def _load_issued_shares(self) -> pd.Series:
+        if self._issued_shares_loaded:
+            return self._issued_shares if self._issued_shares is not None else pd.Series(dtype=float)
+        self._issued_shares_loaded = True
+        try:
+            from qlib.config import C
+
+            provider_uri = getattr(C, "provider_uri", None)
+        except Exception:
+            provider_uri = None
+        if not provider_uri:
+            self._issued_shares = pd.Series(dtype=float)
+            return self._issued_shares
+        try:
+            path = os.path.join(os.path.expanduser(str(provider_uri)), "boardlot", "issued_shares.txt")
+            if not os.path.exists(path):
+                self._issued_shares = pd.Series(dtype=float)
+                return self._issued_shares
+            df = pd.read_csv(path, sep=r"\s+", header=None, comment="#")
+            if df.shape[1] >= 2:
+                df = df.iloc[:, :2]
+                df.columns = ["instrument", "shares"]
+            elif df.shape[1] == 1:
+                df.columns = ["instrument"]
+                df["shares"] = np.nan
+            else:
+                self._issued_shares = pd.Series(dtype=float)
+                return self._issued_shares
+            df["instrument"] = df["instrument"].astype(str)
+            df["shares"] = pd.to_numeric(df["shares"], errors="coerce")
+            df = df.dropna(subset=["shares"])
+            self._issued_shares = df.set_index("instrument")["shares"].astype(float)
+            return self._issued_shares
+        except Exception:
+            self._issued_shares = pd.Series(dtype=float)
+            return self._issued_shares
+
+    def _get_turnover_mask(self, instruments: List[str], trade_date) -> pd.Series:
+        if not instruments:
+            return pd.Series(dtype=bool)
+        shares = self._load_issued_shares()
+        if shares.empty:
+            return pd.Series(self.allow_missing_shares, index=pd.Index(instruments, name="instrument"))
+        try:
+            trade_ts = pd.Timestamp(trade_date)
+            turnover_all = self._turnover_cache.get(trade_ts)
+            if turnover_all is None:
+                feat = D.features(
+                    D.instruments("all"),
+                    ["$volume"],
+                    start_time=trade_ts,
+                    end_time=trade_ts,
+                    freq="day",
+                    disk_cache=True,
+                )
+                if feat is None or feat.empty:
+                    return pd.Series(self.allow_missing_shares, index=pd.Index(instruments, name="instrument"))
+                if isinstance(feat.index, pd.MultiIndex):
+                    vol = feat["$volume"].groupby(level=0).tail(1)
+                    vol.index = vol.index.droplevel("datetime") if "datetime" in vol.index.names else vol.index
+                else:
+                    vol = feat["$volume"]
+                vol = vol.sort_index()
+                shares_all = shares.reindex(vol.index)
+                turnover_all = vol / shares_all
+                self._turnover_cache[trade_ts] = turnover_all
+
+            turnover = turnover_all.reindex(instruments)
+            mask = turnover >= float(self.min_turnover)
+            if self.allow_missing_shares:
+                mask = mask.fillna(True)
+            else:
+                mask = mask.fillna(False)
+            return mask
+        except Exception:
+            return pd.Series(self.allow_missing_shares, index=pd.Index(instruments, name="instrument"))
+
+    def _ensure_macd_cache(self, instruments: List[str]) -> Optional[pd.DataFrame]:
+        fields = ["$DIF", "$DEA", "$DIF_PREV", "$DEA_PREV", "$RSI", "$KDJ_K", "$KDJ_D"]
+        insts = list(dict.fromkeys(instruments))
+        if not insts:
+            return None
+
+        if self._macd_feat_cache is None:
+            try:
+                trade_len = self.trade_calendar.get_trade_len()
+                start_ts = self.trade_calendar.get_step_time(0)[0]
+                end_ts = self.trade_calendar.get_step_time(trade_len - 1)[0]
+            except Exception:
+                start_ts = None
+                end_ts = None
+            self._macd_cache_start = pd.Timestamp(start_ts) if start_ts is not None else None
+            self._macd_cache_end = pd.Timestamp(end_ts) if end_ts is not None else None
+            df = D.features(
+                insts,
+                fields,
+                start_time=self._macd_cache_start,
+                end_time=self._macd_cache_end,
+                freq="day",
+                disk_cache=True,
+            )
+            if df is None or df.empty:
+                return None
+            self._macd_feat_cache = df
+            self._macd_cache_insts = set(insts)
+            return self._macd_feat_cache
+
+        missing = [i for i in insts if i not in self._macd_cache_insts]
+        if missing:
+            df_new = D.features(
+                missing,
+                fields,
+                start_time=self._macd_cache_start,
+                end_time=self._macd_cache_end,
+                freq="day",
+                disk_cache=True,
+            )
+            if df_new is not None and not df_new.empty:
+                self._macd_feat_cache = pd.concat([self._macd_feat_cache, df_new], axis=0)
+                self._macd_cache_insts.update(missing)
+        return self._macd_feat_cache
 
     def _compute_macd_flags(self, instruments: List[str], end_time) -> Dict[str, Dict[str, bool]]:
         # 1) Try precomputed bin features (DIF/DEA/DIF_PREV/DEA_PREV) from D.features
         if instruments:
             try:
                 end_ts = pd.Timestamp(end_time)
-                df_feat = D.features(
-                    instruments,
-                    ["$DIF", "$DEA", "$DIF_PREV", "$DEA_PREV"],
-                    start_time=end_ts,
-                    end_time=end_ts,
-                    freq="day",
-                )
-                if isinstance(df_feat, pd.DataFrame) and not df_feat.empty and isinstance(df_feat.index, pd.MultiIndex):
+                df_all = self._ensure_macd_cache(instruments)
+                if df_all is None or df_all.empty:
+                    return {}
+                if isinstance(df_all, pd.DataFrame) and not df_all.empty and isinstance(df_all.index, pd.MultiIndex):
                     flags: Dict[str, Dict[str, bool]] = {}
-                    for inst, sub in df_feat.groupby(level=0):
+                    for inst, sub in df_all.groupby(level=0):
                         try:
-                            row = sub.droplevel(0).iloc[-1]
+                            sub_inst = sub.droplevel(0)
+                            if isinstance(sub_inst.index, pd.DatetimeIndex):
+                                sub_inst = sub_inst[sub_inst.index <= end_ts]
+                            if sub_inst.empty:
+                                continue
+                            row = sub_inst.iloc[-1]
+                            prev_row = sub_inst.iloc[-2] if len(sub_inst) >= 2 else None
                             dif = float(row.get("$DIF")) if "$DIF" in row else None
                             dea = float(row.get("$DEA")) if "$DEA" in row else None
                             dif_prev = float(row.get("$DIF_PREV")) if "$DIF_PREV" in row else None
                             dea_prev = float(row.get("$DEA_PREV")) if "$DEA_PREV" in row else None
+                            rsi = float(row.get("$RSI")) if "$RSI" in row else None
+                            kdj_k = float(row.get("$KDJ_K")) if "$KDJ_K" in row else None
+                            kdj_d = float(row.get("$KDJ_D")) if "$KDJ_D" in row else None
+                            kdj_k_prev = (
+                                float(prev_row.get("$KDJ_K")) if prev_row is not None and "$KDJ_K" in prev_row else None
+                            )
+                            kdj_d_prev = (
+                                float(prev_row.get("$KDJ_D")) if prev_row is not None and "$KDJ_D" in prev_row else None
+                            )
                         except Exception:
-                            dif = dea = dif_prev = dea_prev = None
+                            dif = dea = dif_prev = dea_prev = rsi = kdj_k = kdj_d = kdj_k_prev = kdj_d_prev = None
                         if None in (dif, dea, dif_prev, dea_prev):
                             continue
-                        buy = dif_prev <= dea_prev and dif > dea and dif > 0
-                        sell = dif_prev >= dea_prev and dif < dea and dif < 0
+                        macd_buy = (
+                            dif_prev <= dea_prev
+                            and dif > dea
+                            and dif > 0
+                            and not (
+                                (rsi is not None and rsi >= self.rsi_overbought)
+                                or (kdj_k is not None and kdj_k >= self.kdj_overbought)
+                            )
+                        )
+                        bottom_buy = (
+                            dif_prev <= dea_prev
+                            and dif > dea
+                            and dif < 0
+                            and kdj_k is not None
+                            and kdj_d is not None
+                            and kdj_k_prev is not None
+                            and kdj_k_prev <= self.kdj_oversold
+                            and kdj_k > kdj_d
+                            and kdj_k > self.kdj_oversold
+                        )
+                        #temp disable bottom buy
+                        bottom_buy = False
+                        kdj_buy = (
+                            kdj_k is not None
+                            and kdj_d is not None
+                            and kdj_k_prev is not None
+                            and kdj_d_prev is not None
+                            and dif is not None
+                            and dif > 0
+                            and not (rsi is not None and rsi >= self.rsi_overbought)
+                            and kdj_k_prev <= kdj_d_prev
+                            and kdj_k > kdj_d
+                        )
+                        buy = macd_buy or kdj_buy or bottom_buy
+                        macd_sell = dif_prev >= dea_prev and dif < dea and (rsi is not None and rsi >= self.rsi_overbought)
+                        kdj_sell = (
+                            kdj_k is not None
+                            and kdj_d is not None
+                            and kdj_k_prev is not None
+                            and kdj_d_prev is not None
+                            and kdj_k >= self.kdj_overbought
+                            and kdj_k_prev >= kdj_d_prev
+                            and kdj_k < kdj_d
+                        )
+                        sell = macd_sell or kdj_sell
                         flags[inst] = {"buy": bool(buy), "sell": bool(sell)}
                     return flags
             except Exception:
                 # fall through to on-the-fly compute if D.features not available
                 pass
 
-        # 2) Fallback: compute on the fly from $close
-        if not instruments:
-            return {}
-        end_ts = pd.Timestamp(end_time)
-        start_ts = end_ts - pd.Timedelta(days=max(self.macd_lookback_days, self.macd_slow * 4))
-        df = D.features(instruments, ["$close"], start_time=start_ts, end_time=end_ts)
-        if df is None or df.empty:
-            return {}
-        flags: Dict[str, Dict[str, bool]] = {}
-        if not isinstance(df.index, pd.MultiIndex):
-            return flags
-        for inst, sub in df.groupby(level=0):
-            try:
-                ser = sub.droplevel(0)["$close"] if "$close" in sub.columns else sub.droplevel(0).iloc[:, 0]
-                ser = ser.sort_index()
-                if ser.shape[0] < 2:
-                    continue
-                ema_fast = ser.ewm(span=self.macd_fast, adjust=False).mean()
-                ema_slow = ser.ewm(span=self.macd_slow, adjust=False).mean()
-                dif = ema_fast - ema_slow
-                dea = dif.ewm(span=self.macd_signal, adjust=False).mean()
-                if dif.shape[0] < 2 or dea.shape[0] < 2:
-                    continue
-                cur_dif, prev_dif = dif.iloc[-1], dif.iloc[-2]
-                cur_dea, prev_dea = dea.iloc[-1], dea.iloc[-2]
-                if any(pd.isna([cur_dif, prev_dif, cur_dea, prev_dea])):
-                    continue
-                buy = prev_dif <= prev_dea and cur_dif > cur_dea and cur_dif > 0
-                sell = prev_dif >= prev_dea and cur_dif < cur_dea and cur_dif < 0
-                flags[inst] = {"buy": bool(buy), "sell": bool(sell)}
-            except Exception:
-                continue
-        return flags
+        return {}
 
     def generate_trade_decision(self, execute_result=None):
         trade_step = self.trade_calendar.get_trade_step()
@@ -410,15 +569,55 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         bullish = {k for k, v in macd_flags.items() if v.get("buy")}
         bearish = {k for k, v in macd_flags.items() if v.get("sell")}
 
-        # If no bullish signals, keep positions unchanged
-        if not bullish:
+        # apply turnover filter to buy candidates
+        if self.min_turnover is not None and bullish:
+            turnover_mask = self._get_turnover_mask(list(bullish), trade_start_time)
+            bullish = {k for k in bullish if bool(turnover_mask.get(k, self.allow_missing_shares))}
+
+        # stop-loss: force sell if price drops below buy price by stop_loss_pct
+        stop_loss_set: Set[str] = set()
+        if self.stop_loss_pct is not None:
+            for code in current_stock_list:
+                try:
+                    buy_price = self.trade_position.position.get(code, {}).get("buy_price", None)
+                except Exception:
+                    buy_price = None
+                if buy_price is None:
+                    continue
+                try:
+                    cur_price = self.trade_exchange.get_deal_price(
+                        stock_id=code,
+                        start_time=trade_start_time,
+                        end_time=trade_end_time,
+                        direction=OrderDir.SELL,
+                    )
+                except Exception:
+                    cur_price = None
+                if cur_price is None:
+                    continue
+                if cur_price <= buy_price * (1 - self.stop_loss_pct):
+                    stop_loss_set.add(code)
+
+        # If no bullish signals and no stop-loss, keep positions unchanged
+        if not bullish and not stop_loss_set:
             return TradeDecisionWO([], self)
 
         # rank existing holdings by score (descending)
         last_scored = pred_score.reindex(current_stock_list).sort_values(ascending=False)
         bearish_holdings = last_scored[last_scored.index.isin(bearish)]
-        # choose bearish to drop, lowest score first, capped by n_drop
-        sell_list = list(bearish_holdings.sort_values(ascending=True).index[: self.n_drop])
+        # always sell holdings that meet sell condition or stop-loss
+        sell_list = list(stop_loss_set)
+        sell_set = set(sell_list)
+        for code in bearish_holdings.sort_values(ascending=True).index:
+            if code not in sell_set:
+                sell_list.append(code)
+                sell_set.add(code)
+        # if sell count < n_drop, fill remaining sells by bottom scores
+        if len(sell_list) < self.n_drop:
+            remaining = last_scored[~last_scored.index.isin(sell_set)]
+            extra_needed = self.n_drop - len(sell_list)
+            extra_sell = list(remaining.sort_values(ascending=True).index[:extra_needed])
+            sell_list.extend(extra_sell)
 
         # buy candidates: bullish not currently held, ranked by score
         bullish_new = pred_score[pred_score.index.isin(bullish) & ~pred_score.index.isin(current_stock_list)]
@@ -430,8 +629,8 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         max_buys = min(len(sell_list) + open_slots, len(bullish_ranked))
         buy_list = list(bullish_ranked.index[:max_buys]) if max_buys > 0 else []
 
-        # if still nothing to buy, keep unchanged (and avoid selling)
-        if not buy_list:
+        # if still nothing to buy, keep unchanged (and avoid selling), unless stop-loss triggered
+        if not buy_list and not stop_loss_set:
             return TradeDecisionWO([], self)
 
         # reuse tradability helpers from parent
@@ -457,8 +656,9 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         for code in sell_list:
             if not is_tradable(code, None if self.forbid_all_trade_at_limit else OrderDir.SELL):
                 continue
-            if current_temp.get_stock_count(code, bar=time_per_step) < self.hold_thresh:
-                continue
+            if code not in stop_loss_set:
+                if current_temp.get_stock_count(code, bar=time_per_step) < self.hold_thresh:
+                    continue
             sell_amount = current_temp.get_stock_amount(code=code)
             sell_order = Order(
                 stock_id=code,

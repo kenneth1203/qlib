@@ -850,9 +850,12 @@ class YahooNormalize1d(YahooNormalize, ABC):
             logger.warning("First close is zero or NaN; skipping manual adjustment to avoid division by zero")
             return df.reset_index()
     
-        # Convert numeric columns (except symbol/adjclose/change) to numeric safely, then apply adjustments
+        # Convert numeric columns (except symbol/adjclose/change and indicators) to numeric safely, then apply adjustments
+        indicator_prefixes = ("DIF", "DEA", "MACD", "RSI", "KDJ", "EMA")
         for _col in df.columns:
             if _col in [self._symbol_field_name, "adjclose", "change"]:
+                continue
+            if str(_col).upper().startswith(indicator_prefixes):
                 continue
             # coerce values to numeric; invalid parsing becomes NaN
             df[_col] = pd.to_numeric(df[_col], errors="coerce")
@@ -1442,6 +1445,12 @@ class Run(BaseRun):
                         )
             except Exception:
                 pass
+        # For HK 1d: compute indicators on source CSVs before normalization
+        if self.region.lower() == "hk" and self.interval.lower() == "1d":
+            try:
+                self._update_hk_source_indicators(trading_date)
+            except Exception as e:
+                logger.warning(f"HK indicator update failed: {e}")
         # NOTE: a larger max_workers setting here would be faster
         self.max_workers = (
             max(multiprocessing.cpu_count() - 2, 1)
@@ -1471,6 +1480,89 @@ class Run(BaseRun):
         )
         for _index in index_list:
             get_instruments(str(qlib_data_1d_dir), _index, market_index=f"{_region}_index")
+
+    @staticmethod
+    def _calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        if "close" not in df.columns:
+            return df
+        s_close = pd.to_numeric(df["close"], errors="coerce")
+
+        ema_fast = s_close.ewm(span=12, adjust=False).mean()
+        ema_slow = s_close.ewm(span=26, adjust=False).mean()
+        dif = ema_fast - ema_slow
+        dea = dif.ewm(span=9, adjust=False).mean()
+        macd = 2 * (dif - dea)
+
+        df["DIF"] = dif
+        df["DEA"] = dea
+        df["MACD"] = macd
+        df["DIF_PREV"] = dif.shift(1)
+        df["DEA_PREV"] = dea.shift(1)
+
+        # RSI(14)
+        delta = s_close.diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = -delta.where(delta < 0, 0.0)
+        avg_gain = gain.rolling(14, min_periods=14).mean()
+        avg_loss = loss.rolling(14, min_periods=14).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        df["RSI"] = rsi
+
+        # KDJ(9)
+        low_n = pd.to_numeric(df.get("low"), errors="coerce").rolling(9, min_periods=9).min()
+        high_n = pd.to_numeric(df.get("high"), errors="coerce").rolling(9, min_periods=9).max()
+        rsv = (s_close - low_n) / (high_n - low_n) * 100
+        k = rsv.ewm(alpha=1 / 3, adjust=False).mean()
+        d = k.ewm(alpha=1 / 3, adjust=False).mean()
+        j = 3 * k - 2 * d
+        df["KDJ_K"] = k
+        df["KDJ_D"] = d
+        df["KDJ_J"] = j
+
+        # EMA family
+        df["EMA5"] = s_close.ewm(span=5, adjust=False).mean()
+        df["EMA10"] = s_close.ewm(span=10, adjust=False).mean()
+        df["EMA20"] = s_close.ewm(span=20, adjust=False).mean()
+        df["EMA60"] = s_close.ewm(span=60, adjust=False).mean()
+        df["EMA120"] = s_close.ewm(span=120, adjust=False).mean()
+
+        return df
+
+    def _update_hk_source_indicators(self, trading_date: str):
+        src_dir = Path(self.source_dir).expanduser()
+        if not src_dir.exists():
+            logger.warning(f"HK source_dir not found: {src_dir}")
+            return
+        try:
+            trading_ts = pd.to_datetime(trading_date)
+        except Exception:
+            trading_ts = None
+
+        csv_list = list(src_dir.glob("*.csv"))
+        if not csv_list:
+            logger.warning(f"No source CSVs found in {src_dir}")
+            return
+
+        for csv_path in csv_list:
+            try:
+                df = pd.read_csv(csv_path)
+                if df.empty or "date" not in df.columns:
+                    continue
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                if trading_ts is not None:
+                    if df["date"].dropna().max() is None:
+                        continue
+                    if df["date"].dropna().max() < trading_ts:
+                        continue
+                df = df.sort_values("date").reset_index(drop=True)
+                df = self._calc_indicators(df)
+                df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+                df.to_csv(csv_path, index=False)
+            except Exception as e:
+                logger.warning(f"Indicator calc failed for {csv_path}: {e}")
 
 
 if __name__ == "__main__":

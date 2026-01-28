@@ -87,7 +87,7 @@ def _compute_indicators_for_instrument(sub: pd.DataFrame) -> pd.DataFrame:
     for w in (5, 10, 20, 60, 120):
         out[f"EMA{w}"] = close.ewm(span=w, adjust=False).mean()
 
-    return out
+    return out.fillna(0.0)
 
 
 def _chunk_list(lst: Iterable[str], size: int):

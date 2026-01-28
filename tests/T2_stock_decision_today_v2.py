@@ -103,17 +103,17 @@ def load_selection(recorder_id: str, topk: int, target_day: str) -> List[str]:
     """Load selected instruments for target_day.
     Prefer CSV next to working dir; fallback to pred pickle reconstruction.
     """
-    csv_path = f"selected_today_{recorder_id}.csv"
+    day_str = pd.to_datetime(target_day).strftime("%Y%m%d")
+    csv_path = f"selection_{day_str}_{recorder_id}.csv"
     if os.path.exists(csv_path):
         df = pd.read_csv(csv_path)
-        cols = [c for c in df.columns if c.lower().startswith("instrument")]
+        cols = [c for c in df.columns if c.lower().startswith("id")]
         if len(cols) > 0:
             return [to_qlib_inst(i) for i in df[cols[0]].astype(str).tolist()][:topk]
 
     # fallback: load prediction pickle
     dated_path = _dated_pred_path(recorder_id, target_day)
-    legacy_path = Path(f"pred_today_{recorder_id}.pkl")
-    pkl_path = dated_path if dated_path.exists() else legacy_path
+    pkl_path = dated_path
     print(f"load_selection using pred file: {pkl_path}")
     if not pkl_path.exists():
         raise RuntimeError(f"Missing selection CSV and prediction pickle: {csv_path}, {pkl_path}")
@@ -159,8 +159,7 @@ def load_model_scores(recorder_id: str, target_day: str) -> Dict[str, float]:
     model_scores: Dict[str, float] = {}
     try:
         dated_path = _dated_pred_path(recorder_id, target_day)
-        legacy_path = Path(f"pred_today_{recorder_id}.pkl")
-        pkl_path = dated_path if dated_path.exists() else legacy_path
+        pkl_path = dated_path
         if not pkl_path.exists():
             return model_scores
         print(f"load_model_scores using pred file: {pkl_path}")
@@ -206,9 +205,6 @@ def load_selection_history(recorder_id: str, topk: int, target_day: str, lookbac
     history: Dict[str, List[str]] = {}
     try:
         paths = _list_dated_pred_paths(recorder_id, target_day, lookback_days)
-        legacy_path = Path(f"pred_today_{recorder_id}.pkl")
-        if not paths and legacy_path.exists():
-            paths = [legacy_path]
         if not paths:
             return history
 
