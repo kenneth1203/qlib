@@ -172,25 +172,37 @@ if __name__ == "__main__":
     # keep a module-scoped name for later use (extra_quote / backtest override)
     _last_trading_day = last_day
 
-    # --- Liquidity filter: use T0b_stock_filter (amount + turnover) ---
+    # --- Liquidity filter: read precomputed CSV; fallback to legacy ---
     handler_kwargs = HK_GBDT_TASK["dataset"]["kwargs"]["handler"]["kwargs"]
     try:
-        from qlib.tests import T0b_stock_filter as stock_filter  # type: ignore
+        csv_path = os.path.abspath(os.path.join(os.getcwd(), "instrument_filtered.csv"))
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"instrument_filtered.csv not found at {csv_path}")
 
-        keep_insts, info = stock_filter.filter_instruments_by_conditions(
-            instruments=D.instruments("all"),
-            target_day=handler_kwargs.get("end_time", None),
-            provider_uri=provider_uri,
-            min_avg_amount=3_000_000,
-            avg_amount_window=60,
-            min_turnover=0.001,
-            auto_init=False,
-        )
+        df = pd.read_csv(csv_path)
+        if df.empty:
+            raise RuntimeError(f"instrument_filtered.csv is empty at {csv_path}")
+
+        inst_col = "instrument" if "instrument" in df.columns else df.columns[0]
+        keep_insts = df[inst_col].astype(str).tolist()
+        orig_count = len(keep_insts)
+        info = {
+            "orig_count": orig_count,
+            "kept_count": orig_count,
+            "pct": 100.0,
+            "sample": keep_insts[:20],
+            "csv_path": csv_path,
+        }
+        for meta in ["min_avg_amount", "avg_amount_window", "min_turnover", "turnover_window", "target_day", "allow_missing_shares"]:
+            if meta in df.columns:
+                info[meta] = df[meta].iloc[0]
         print(
-            f"Liquidity filter (T0b): kept {info['kept_count']} / {info['orig_count']} instruments ({info['pct']:.2f}%)"
+            f"Liquidity filter (CSV): kept {info['kept_count']} / {info['orig_count']} instruments ({info['pct']:.2f}%)"
         )
         print("Sample kept instruments:", info.get("sample", []))
-    except Exception:
+        print("Using precomputed CSV:", csv_path)
+    except Exception as e:
+        print("CSV liquidity load failed, switching to fallback:", e)
         keep_insts, info = compute_liquid_instruments(
             liq_threshold=30_000_000,
             liq_window=60,
@@ -256,12 +268,17 @@ if __name__ == "__main__":
             },
         },
         "strategy": {
-            "class": "TopkDropoutStrategy",
+            "class": "MACDTopkDropoutStrategy",
             "module_path": "qlib.contrib.strategy.signal_strategy",
             "kwargs": {
                 "signal": (model, dataset),
                 "topk": 12,
                 "n_drop": 2,
+                "macd_fast": 12,
+                "macd_slow": 26,
+                "macd_signal": 9,
+                "macd_lookback_days": 200,
+                "indicator_csv": os.path.abspath(os.path.join(os.getcwd(), "instrument_filtered.csv")),
                 "only_tradable": True,
                 "forbid_all_trade_at_limit": True
             },

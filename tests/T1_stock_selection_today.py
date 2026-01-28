@@ -14,6 +14,7 @@ import os
 import pickle
 from typing import Optional
 import sys
+import pandas as pd
 
 import qlib
 from qlib.workflow import R
@@ -29,6 +30,16 @@ from qlib.utils.func import (
     calendar_last_day,
     next_trading_day_from_future,
 )
+
+
+def _escape_markdown_v2(text: str) -> str:
+    # Telegram MarkdownV2 reserved characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
+    if text is None:
+        return ""
+    s = str(text)
+    for ch in "_[]()~`>#+-=|{}.!":
+        s = s.replace(ch, f"\\{ch}")
+    return s
 
 # Ensure stdout is UTF-8 on Windows to avoid GBK-related mojibake when printing Chinese
 try:
@@ -116,22 +127,33 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
             pass
         liq_window = 60
         try:
-            from qlib.tests import T0b_stock_filter as stock_filter  # type: ignore
+            csv_path = os.path.abspath(os.path.join(os.getcwd(), "instrument_filtered.csv"))
+            if not os.path.exists(csv_path):
+                raise FileNotFoundError(f"instrument_filtered.csv not found at {csv_path}")
 
-            keep_insts, info = stock_filter.filter_instruments_by_conditions(
-                instruments=D.instruments("all"),
-                target_day=hkw.get("end_time", None),
-                provider_uri=provider_uri,
-                min_avg_amount=3_000_000,
-                avg_amount_window=liq_window,
-                min_turnover=0.001,
-                auto_init=False,
-            )
+            df_csv = pd.read_csv(csv_path)
+            if df_csv.empty:
+                raise RuntimeError(f"instrument_filtered.csv is empty at {csv_path}")
+
+            inst_col = "instrument" if "instrument" in df_csv.columns else df_csv.columns[0]
+            keep_insts = df_csv[inst_col].astype(str).tolist()
+            info = {
+                "orig_count": len(keep_insts),
+                "kept_count": len(keep_insts),
+                "pct": 100.0,
+                "sample": keep_insts[:20],
+                "csv_path": csv_path,
+            }
+            for meta in ["min_avg_amount", "avg_amount_window", "min_turnover", "turnover_window", "target_day", "allow_missing_shares"]:
+                if meta in df_csv.columns:
+                    info[meta] = df_csv[meta].iloc[0]
             print(
-                f"Liquidity filter (predict, T0b): kept {info['kept_count']} / {info['orig_count']} instruments ({info['pct']:.2f}%)"
+                f"Liquidity filter (predict, CSV): kept {info['kept_count']} / {info['orig_count']} instruments ({info['pct']:.2f}%)"
             )
             print("Sample kept instruments:", info.get("sample", []))
-        except Exception:
+            print("Using precomputed CSV:", csv_path)
+        except Exception as e:
+            print(f"Loading liquidity filter from CSV failed: {e}, falling back to dynamic computation.")
             keep_insts, info = hkmod.compute_liquid_instruments(
                 liq_threshold=30_000_000,
                 liq_window=liq_window,
@@ -150,7 +172,7 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
             insts = list(hkw.get("instruments", []))
             if insts:
                 try:
-                    import pandas as pd
+                    #import pandas as pd
 
                     listing_df = D.features(
                         insts,
@@ -202,7 +224,7 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
     try:
         X_test = dataset.prepare("test")
         try:
-            import pandas as pd
+            #import pandas as pd
 
             if hasattr(X_test, "empty") and X_test.empty:
                 print("Prepared test features: EMPTY")
@@ -244,7 +266,7 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
 
     # pred expected as pandas Series/DataFrame with MultiIndex containing instrument & datetime
     try:
-        import pandas as pd
+        #import pandas as pd
 
         # normalize to Series of scores
         if isinstance(pred, pd.DataFrame):
@@ -286,12 +308,51 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
 
             # --- Select top-k (liquidity + listing pre-filters already applied via handler) ---
             cand_insts = [to_qlib_inst(i) for i in top.index]
-            selected = cand_insts[:topk]
+            print(f"Total candidate instruments after pre-filters: {len(cand_insts)}")
+            # apply bullish MACD trend filter (same as backtest gate: DIF crosses above DEA and DIF>0)
+            bullish_set = set()
+            golden_set = set()
+            try:
+                if cand_insts:
+                    feat = D.features(
+                        cand_insts,
+                        ["$DIF", "$DEA", "$DIF_PREV", "$DEA_PREV"],
+                        start_time=target_day,
+                        end_time=target_day,
+                        freq="day",
+                    )
+                    if isinstance(feat, pd.DataFrame) and not feat.empty and isinstance(feat.index, pd.MultiIndex):
+                        for inst, sub in feat.groupby(level=0):
+                            try:
+                                row = sub.droplevel(0).iloc[-1]
+                                dif = float(row.get("$DIF")) if "$DIF" in row else None
+                                dea = float(row.get("$DEA")) if "$DEA" in row else None
+                                dif_prev = float(row.get("$DIF_PREV")) if "$DIF_PREV" in row else None
+                                dea_prev = float(row.get("$DEA_PREV")) if "$DEA_PREV" in row else None
+                            except Exception:
+                                dif = dea = dif_prev = dea_prev = None
+                            if None in (dif, dea, dif_prev, dea_prev):
+                                continue
+                            if dif > dea and dif > 0:
+                                bullish_set.add(inst)
+                                if dif_prev <= dea_prev:
+                                    golden_set.add(inst)
+            except Exception:
+                bullish_set = set()
+                golden_set = set()
+
+            if bullish_set:
+                cand_insts = [i for i in cand_insts if i in bullish_set]
+            # select top-k from bullish candidates ranked by model score
+            golden_ranked = [i for i in cand_insts if i in golden_set]
+            bullish_ranked = [i for i in cand_insts if i in bullish_set and i not in golden_set]
+            print("sample of golden cross instruments:", golden_ranked[:5], "sample of bullish instruments:", bullish_ranked[:5])
+            selected = (golden_ranked + bullish_ranked)[:topk]
 
             mapping = load_chinese_name_map()
 
             # Print selected top instruments with Chinese names and last-day volume
-            score_df = pd.DataFrame({"score": list(top.values)}, index=cand_insts)
+            score_df = top.reindex(cand_insts).to_frame("score")
             score_df.index.name = "instrument"
 
             vol_map = {}
@@ -355,7 +416,8 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
     except Exception:
         print("Prediction result:", pred)
 
-    # save prediction locally (dated file) and keep legacy name for compatibility
+    # save selected list locally (dated file) and keep legacy name for compatibility
+    pred = selected if "selected" in locals() else pred
     day_str = pd.to_datetime(target_day).strftime("%Y%m%d")
     out_dated = f"pred_{day_str}_{recorder_id}.pkl"
     with open(out_dated, "wb") as f:
@@ -379,6 +441,7 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
             payload_lines = ["```", f"T1 selection for {msg_day}", f"recorder_id: {recorder_id}"] + table_lines + ["```"]
         else:
             payload_lines = [f"T1 selection for {msg_day}", f"recorder_id: {recorder_id}"]
+        #safe_lines = [_escape_markdown_v2(line) for line in payload_lines]
         notifier.send("\n".join(payload_lines))
 
 if __name__ == "__main__":
@@ -387,7 +450,7 @@ if __name__ == "__main__":
     parser.add_argument("--experiment_name", default="workflow", help="experiment name")
     parser.add_argument("--provider_uri", default="~/.qlib/qlib_data/hk_data", help="qlib data dir")
     parser.add_argument("--topk", type=int, default=20, help="print top-k instruments")
-    parser.add_argument("--min_listing_days", type=int, default=120, help="minimum trading days since listing; set 0 to disable filter")
+    parser.add_argument("--min_listing_days", type=int, default=0, help="minimum trading days since listing; set 0 to disable filter")
     parser.add_argument("--telegram_token", help="telegram bot token (optional)")
     parser.add_argument("--telegram_chat_id", help="telegram chat id (optional)")
     parser.add_argument("--notify_config", help="path to JSON config with telegram_token/chat_id")

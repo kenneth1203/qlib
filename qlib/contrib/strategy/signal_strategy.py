@@ -6,7 +6,7 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from typing import Dict, List, Text, Tuple, Union
+from typing import Dict, List, Text, Tuple, Union, Set, Optional
 from abc import ABC
 
 from qlib.data import D
@@ -292,6 +292,210 @@ class TopkDropoutStrategy(BaseSignalStrategy):
                 direction=Order.BUY,  # 1 for buy
             )
             buy_order_list.append(buy_order)
+        return TradeDecisionWO(sell_order_list + buy_order_list, self)
+
+
+class MACDTopkDropoutStrategy(TopkDropoutStrategy):
+    """TopkDropout with MACD-based buy/sell gating.
+
+    - Buy when DIF crosses above DEA and DIF>0 (bullish) and rank by score.
+    - Sell when DIF crosses below DEA and DIF<0 (bearish), capped by n_drop.
+    - If no bullish candidates, do nothing (keep current holdings; do not force-fill topk).
+    - If bullish candidates exist, attempt swaps using available bearish names; do not force fill beyond available bullish names.
+    - Other behaviors (tradable check, hold_thresh, limit handling) follow TopkDropoutStrategy.
+    """
+
+    def __init__(
+        self,
+        *,
+        topk,
+        n_drop,
+        macd_fast: int = 12,
+        macd_slow: int = 26,
+        macd_signal: int = 9,
+        macd_lookback_days: int = 200,
+        indicator_csv: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(topk=topk, n_drop=n_drop, **kwargs)
+        self.macd_fast = macd_fast
+        self.macd_slow = macd_slow
+        self.macd_signal = macd_signal
+        self.macd_lookback_days = macd_lookback_days
+        # indicator_csv is deprecated here; we always read from bin features
+        self.indicator_csv = None
+        self._indicator_df: Optional[pd.DataFrame] = None
+
+    def _compute_macd_flags(self, instruments: List[str], end_time) -> Dict[str, Dict[str, bool]]:
+        # 1) Try precomputed bin features (DIF/DEA/DIF_PREV/DEA_PREV) from D.features
+        if instruments:
+            try:
+                end_ts = pd.Timestamp(end_time)
+                df_feat = D.features(
+                    instruments,
+                    ["$DIF", "$DEA", "$DIF_PREV", "$DEA_PREV"],
+                    start_time=end_ts,
+                    end_time=end_ts,
+                    freq="day",
+                )
+                if isinstance(df_feat, pd.DataFrame) and not df_feat.empty and isinstance(df_feat.index, pd.MultiIndex):
+                    flags: Dict[str, Dict[str, bool]] = {}
+                    for inst, sub in df_feat.groupby(level=0):
+                        try:
+                            row = sub.droplevel(0).iloc[-1]
+                            dif = float(row.get("$DIF")) if "$DIF" in row else None
+                            dea = float(row.get("$DEA")) if "$DEA" in row else None
+                            dif_prev = float(row.get("$DIF_PREV")) if "$DIF_PREV" in row else None
+                            dea_prev = float(row.get("$DEA_PREV")) if "$DEA_PREV" in row else None
+                        except Exception:
+                            dif = dea = dif_prev = dea_prev = None
+                        if None in (dif, dea, dif_prev, dea_prev):
+                            continue
+                        buy = dif_prev <= dea_prev and dif > dea and dif > 0
+                        sell = dif_prev >= dea_prev and dif < dea and dif < 0
+                        flags[inst] = {"buy": bool(buy), "sell": bool(sell)}
+                    return flags
+            except Exception:
+                # fall through to on-the-fly compute if D.features not available
+                pass
+
+        # 2) Fallback: compute on the fly from $close
+        if not instruments:
+            return {}
+        end_ts = pd.Timestamp(end_time)
+        start_ts = end_ts - pd.Timedelta(days=max(self.macd_lookback_days, self.macd_slow * 4))
+        df = D.features(instruments, ["$close"], start_time=start_ts, end_time=end_ts)
+        if df is None or df.empty:
+            return {}
+        flags: Dict[str, Dict[str, bool]] = {}
+        if not isinstance(df.index, pd.MultiIndex):
+            return flags
+        for inst, sub in df.groupby(level=0):
+            try:
+                ser = sub.droplevel(0)["$close"] if "$close" in sub.columns else sub.droplevel(0).iloc[:, 0]
+                ser = ser.sort_index()
+                if ser.shape[0] < 2:
+                    continue
+                ema_fast = ser.ewm(span=self.macd_fast, adjust=False).mean()
+                ema_slow = ser.ewm(span=self.macd_slow, adjust=False).mean()
+                dif = ema_fast - ema_slow
+                dea = dif.ewm(span=self.macd_signal, adjust=False).mean()
+                if dif.shape[0] < 2 or dea.shape[0] < 2:
+                    continue
+                cur_dif, prev_dif = dif.iloc[-1], dif.iloc[-2]
+                cur_dea, prev_dea = dea.iloc[-1], dea.iloc[-2]
+                if any(pd.isna([cur_dif, prev_dif, cur_dea, prev_dea])):
+                    continue
+                buy = prev_dif <= prev_dea and cur_dif > cur_dea and cur_dif > 0
+                sell = prev_dif >= prev_dea and cur_dif < cur_dea and cur_dif < 0
+                flags[inst] = {"buy": bool(buy), "sell": bool(sell)}
+            except Exception:
+                continue
+        return flags
+
+    def generate_trade_decision(self, execute_result=None):
+        trade_step = self.trade_calendar.get_trade_step()
+        trade_start_time, trade_end_time = self.trade_calendar.get_step_time(trade_step)
+        pred_start_time, pred_end_time = self.trade_calendar.get_step_time(trade_step, shift=1)
+        pred_score = self.signal.get_signal(start_time=pred_start_time, end_time=pred_end_time)
+        if isinstance(pred_score, pd.DataFrame):
+            pred_score = pred_score.iloc[:, 0]
+        if pred_score is None:
+            return TradeDecisionWO([], self)
+
+        # MACD flags on union of holdings and candidate universe
+        current_stock_list = list(self.trade_position.get_stock_list())
+        candidates: Set[str] = set(current_stock_list) | set(pred_score.index.tolist())
+        macd_flags = self._compute_macd_flags(list(candidates), trade_start_time)
+        bullish = {k for k, v in macd_flags.items() if v.get("buy")}
+        bearish = {k for k, v in macd_flags.items() if v.get("sell")}
+
+        # If no bullish signals, keep positions unchanged
+        if not bullish:
+            return TradeDecisionWO([], self)
+
+        # rank existing holdings by score (descending)
+        last_scored = pred_score.reindex(current_stock_list).sort_values(ascending=False)
+        bearish_holdings = last_scored[last_scored.index.isin(bearish)]
+        # choose bearish to drop, lowest score first, capped by n_drop
+        sell_list = list(bearish_holdings.sort_values(ascending=True).index[: self.n_drop])
+
+        # buy candidates: bullish not currently held, ranked by score
+        bullish_new = pred_score[pred_score.index.isin(bullish) & ~pred_score.index.isin(current_stock_list)]
+        bullish_ranked = bullish_new.sort_values(ascending=False)
+
+        # capacity: free slots after planned sells, plus any gap to topk
+        post_sell_holdings = len(current_stock_list) - len(sell_list)
+        open_slots = max(self.topk - post_sell_holdings, 0)
+        max_buys = min(len(sell_list) + open_slots, len(bullish_ranked))
+        buy_list = list(bullish_ranked.index[:max_buys]) if max_buys > 0 else []
+
+        # if still nothing to buy, keep unchanged (and avoid selling)
+        if not buy_list:
+            return TradeDecisionWO([], self)
+
+        # reuse tradability helpers from parent
+        if self.only_tradable:
+            def is_tradable(code, direction):
+                return self.trade_exchange.is_stock_tradable(
+                    stock_id=code,
+                    start_time=trade_start_time,
+                    end_time=trade_end_time,
+                    direction=direction,
+                )
+        else:
+            def is_tradable(code, direction):
+                return True
+
+        current_temp: Position = copy.deepcopy(self.trade_position)
+        sell_order_list = []
+        buy_order_list = []
+        cash = current_temp.get_cash()
+
+        # execute sells first
+        time_per_step = self.trade_calendar.get_freq()
+        for code in sell_list:
+            if not is_tradable(code, None if self.forbid_all_trade_at_limit else OrderDir.SELL):
+                continue
+            if current_temp.get_stock_count(code, bar=time_per_step) < self.hold_thresh:
+                continue
+            sell_amount = current_temp.get_stock_amount(code=code)
+            sell_order = Order(
+                stock_id=code,
+                amount=sell_amount,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
+                direction=Order.SELL,
+            )
+            if self.trade_exchange.check_order(sell_order):
+                sell_order_list.append(sell_order)
+                trade_val, trade_cost, trade_price = self.trade_exchange.deal_order(sell_order, position=current_temp)
+                cash += trade_val - trade_cost
+
+        # allocate cash equally to buys
+        value = cash * self.risk_degree / len(buy_list) if len(buy_list) > 0 else 0
+        for code in buy_list:
+            if not is_tradable(code, None if self.forbid_all_trade_at_limit else OrderDir.BUY):
+                continue
+            buy_price = self.trade_exchange.get_deal_price(
+                stock_id=code, start_time=trade_start_time, end_time=trade_end_time, direction=OrderDir.BUY
+            )
+            buy_amount = value / buy_price if buy_price not in (None, 0) else 0
+            factor = self.trade_exchange.get_factor(
+                stock_id=code, start_time=trade_start_time, end_time=trade_end_time
+            )
+            buy_amount = self.trade_exchange.round_amount_by_trade_unit(buy_amount, factor)
+            if buy_amount <= 0:
+                continue
+            buy_order = Order(
+                stock_id=code,
+                amount=buy_amount,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
+                direction=Order.BUY,
+            )
+            buy_order_list.append(buy_order)
+
         return TradeDecisionWO(sell_order_list + buy_order_list, self)
 
 

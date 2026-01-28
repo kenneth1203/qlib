@@ -119,6 +119,9 @@ def load_selection(recorder_id: str, topk: int, target_day: str) -> List[str]:
         raise RuntimeError(f"Missing selection CSV and prediction pickle: {csv_path}, {pkl_path}")
 
     pred = pd.read_pickle(pkl_path)
+    # If T1 dumped a list of selected instruments, use it directly
+    if isinstance(pred, list):
+        return [to_qlib_inst(i) for i in pred][:topk]
     # normalize to Series and filter to target day
     if isinstance(pred, pd.DataFrame):
         s = pred.iloc[:, 0]

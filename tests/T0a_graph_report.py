@@ -59,7 +59,33 @@ if __name__ == "__main__":
 
     dataset = init_instance_by_config(HK_GBDT_TASK["dataset"])
 
-    recorder = R.get_recorder(recorder_id="3e3febba13ee43d4bf40cd27122b96cc", experiment_name="workflow")
+    # Auto-detect latest recorder_id from ./mlruns and use it
+    try:
+        mlruns_dir = os.path.join(".", "mlruns")
+        rec_id = None
+        if os.path.isdir(mlruns_dir):
+            runs = []
+            try:
+                for exp in os.listdir(mlruns_dir):
+                    exp_path = os.path.join(mlruns_dir, exp)
+                    if not os.path.isdir(exp_path):
+                        continue
+                    for run in os.listdir(exp_path):
+                        run_path = os.path.join(exp_path, run)
+                        if os.path.isdir(run_path):
+                            runs.append(run_path)
+            except Exception:
+                runs = []
+            if runs:
+                latest = max(runs, key=lambda p: os.path.getmtime(p))
+                rec_id = os.path.basename(os.path.normpath(latest))
+                print(f"Auto-detected recorder_id from mlruns: {rec_id}")
+        if rec_id:
+            recorder = R.get_recorder(recorder_id=rec_id, experiment_name="workflow")
+        else:
+            recorder = R.get_recorder(experiment_name="workflow")
+    except Exception:
+        recorder = R.get_recorder(experiment_name="workflow")
     print(recorder)
     pred_df = recorder.load_object("pred.pkl")
     report_normal_df = recorder.load_object("portfolio_analysis/report_normal_1day.pkl")
