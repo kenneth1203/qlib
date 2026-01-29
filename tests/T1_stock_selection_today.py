@@ -309,52 +309,67 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
             # --- Select top-k (liquidity + listing pre-filters already applied via handler) ---
             cand_insts = [to_qlib_inst(i) for i in top.index]
             print(f"Total candidate instruments after pre-filters: {len(cand_insts)}")
-            # apply bullish MACD trend filter (same as backtest gate: DIF crosses above DEA and DIF>0)
+            # apply multi-condition trend filter
             bullish_set = set()
             golden_set = set()
             try:
                 if cand_insts:
+                    start_dt = (pd.to_datetime(target_day) - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
                     feat = D.features(
                         cand_insts,
-                        ["$DIF", "$DEA", "$DIF_PREV", "$DEA_PREV", "$KDJ_K", "$KDJ_D"],
-                        start_time=target_day,
+                        ["$close", "$EMA120", "$DIF", "$DEA", "$KDJ_K", "$KDJ_D"],
+                        start_time=start_dt,
                         end_time=target_day,
                         freq="day",
                     )
                     if isinstance(feat, pd.DataFrame) and not feat.empty and isinstance(feat.index, pd.MultiIndex):
                         for inst, sub in feat.groupby(level=0):
+                            sub_inst = sub.droplevel(0).sort_index()
+                            if sub_inst.empty:
+                                continue
+                            row = sub_inst.iloc[-1]
+                            prev_row = sub_inst.iloc[-2] if len(sub_inst) >= 2 else None
+
                             try:
-                                row = sub.droplevel(0).iloc[-1]
+                                close = float(row.get("$close")) if "$close" in row else None
+                                ema120 = float(row.get("$EMA120")) if "$EMA120" in row else None
                                 dif = float(row.get("$DIF")) if "$DIF" in row else None
                                 dea = float(row.get("$DEA")) if "$DEA" in row else None
-                                dif_prev = float(row.get("$DIF_PREV")) if "$DIF_PREV" in row else None
-                                dea_prev = float(row.get("$DEA_PREV")) if "$DEA_PREV" in row else None
                                 kdj_k = float(row.get("$KDJ_K")) if "$KDJ_K" in row else None
                                 kdj_d = float(row.get("$KDJ_D")) if "$KDJ_D" in row else None
+                                kdj_k_prev = float(prev_row.get("$KDJ_K")) if prev_row is not None and "$KDJ_K" in prev_row else None
+                                kdj_d_prev = float(prev_row.get("$KDJ_D")) if prev_row is not None and "$KDJ_D" in prev_row else None
                             except Exception:
-                                dif = dea = dif_prev = dea_prev = kdj_k = kdj_d = None
-                            if None in (dif, dea, dif_prev, dea_prev):
-                                continue
-                            if dif > dea and dif > 0:
+                                close = ema120 = dif = dea = kdj_k = kdj_d = kdj_k_prev = kdj_d_prev = None
+
+                            # weekly trend: DIF>0 and DEA>0
+                            weekly_dif = None
+                            weekly_dea = None
+                            try:
+                                weekly = sub_inst.resample("W-FRI").last()
+                                if not weekly.empty:
+                                    w_row = weekly.iloc[-1]
+                                    weekly_dif = float(w_row.get("$DIF")) if "$DIF" in w_row else None
+                                    weekly_dea = float(w_row.get("$DEA")) if "$DEA" in w_row else None
+                            except Exception:
+                                weekly_dif = weekly_dea = None
+
+                            cond1 = weekly_dif is not None and weekly_dea is not None and weekly_dif > 0 and weekly_dea > 0
+                            cond2 = close is not None and ema120 is not None and close > ema120
+                            cond3 = dif is not None and dea is not None and dif > dea
+                            cond4 = (
+                                kdj_k is not None
+                                and kdj_d is not None
+                                and kdj_k_prev is not None
+                                and kdj_d_prev is not None
+                                and kdj_k_prev <= kdj_d_prev
+                                and kdj_k > kdj_d
+                            )
+
+                            if cond3:
                                 bullish_set.add(inst)
-                                if dif_prev <= dea_prev:
+                                if cond4:
                                     golden_set.add(inst)
-                            # KDJ golden cross (use prev from *_PREV if available; fallback to current only)
-                            if kdj_k is not None and kdj_d is not None:
-                                # Try to infer prev from current batch if present
-                                kdj_k_prev = None
-                                kdj_d_prev = None
-                                try:
-                                    if len(sub) >= 2:
-                                        prev_row = sub.droplevel(0).iloc[-2]
-                                        kdj_k_prev = float(prev_row.get("$KDJ_K")) if "$KDJ_K" in prev_row else None
-                                        kdj_d_prev = float(prev_row.get("$KDJ_D")) if "$KDJ_D" in prev_row else None
-                                except Exception:
-                                    kdj_k_prev = kdj_d_prev = None
-                                if kdj_k_prev is not None and kdj_d_prev is not None:
-                                    if dif is not None and dif > 0:
-                                        if kdj_k_prev <= kdj_d_prev and kdj_k > kdj_d:
-                                            golden_set.add(inst)
             except Exception:
                 bullish_set = set()
                 golden_set = set()
