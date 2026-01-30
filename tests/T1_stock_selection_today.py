@@ -74,6 +74,7 @@ def _pad_left(s, width):
 
 def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120, notifier: Optional[TelegramNotifier] = None):
     provider_uri = os.path.expanduser(provider_uri)
+    week_provider_uri = os.path.expanduser("~/.qlib/qlib_data/hk_data_1w")
     qlib.init(provider_uri=provider_uri, region=REG_HK)
 
     # import the HK example dataset config
@@ -312,6 +313,16 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
             # apply multi-condition trend filter
             bullish_set = set()
             golden_set = set()
+            def _weekly_dif_dea(close_s: pd.Series):
+                close_s = close_s.dropna().astype(float)
+                if close_s.empty:
+                    return None, None
+                ema_fast = close_s.ewm(span=12, adjust=False).mean()
+                ema_slow = close_s.ewm(span=26, adjust=False).mean()
+                dif = ema_fast - ema_slow
+                dea = dif.ewm(span=9, adjust=False).mean()
+                return float(dif.iloc[-1]), float(dea.iloc[-1])
+
             try:
                 if cand_insts:
                     start_dt = (pd.to_datetime(target_day) - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
@@ -322,6 +333,33 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                         end_time=target_day,
                         freq="day",
                     )
+                    weekly_map = {}
+                    try:
+                        qlib.init(provider_uri=week_provider_uri, region=REG_HK)
+                        weekly_feat = D.features(
+                            cand_insts,
+                            ["$close"],
+                            start_time=start_dt,
+                            end_time=target_day,
+                        )
+                        if (
+                            isinstance(weekly_feat, pd.DataFrame)
+                            and not weekly_feat.empty
+                            and isinstance(weekly_feat.index, pd.MultiIndex)
+                        ):
+                            for inst, w_sub in weekly_feat.groupby(level=0):
+                                w_inst = w_sub.droplevel(0).sort_index()
+                                if w_inst.empty:
+                                    continue
+                                w_row = w_inst.iloc[-1]
+                                if "$close" not in w_inst.columns:
+                                    continue
+                                w_dif, w_dea = _weekly_dif_dea(w_inst["$close"])
+                                weekly_map[inst] = (w_dif, w_dea)
+                    except Exception:
+                        weekly_map = {}
+                    finally:
+                        qlib.init(provider_uri=provider_uri, region=REG_HK)
                     if isinstance(feat, pd.DataFrame) and not feat.empty and isinstance(feat.index, pd.MultiIndex):
                         for inst, sub in feat.groupby(level=0):
                             sub_inst = sub.droplevel(0).sort_index()
@@ -345,14 +383,8 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                             # weekly trend: DIF>0 and DEA>0
                             weekly_dif = None
                             weekly_dea = None
-                            try:
-                                weekly = sub_inst.resample("W-FRI").last()
-                                if not weekly.empty:
-                                    w_row = weekly.iloc[-1]
-                                    weekly_dif = float(w_row.get("$DIF")) if "$DIF" in w_row else None
-                                    weekly_dea = float(w_row.get("$DEA")) if "$DEA" in w_row else None
-                            except Exception:
-                                weekly_dif = weekly_dea = None
+                            if inst in weekly_map:
+                                weekly_dif, weekly_dea = weekly_map.get(inst, (None, None))
 
                             cond1 = weekly_dif is not None and weekly_dea is not None and weekly_dif > 0 and weekly_dea > 0
                             cond2 = close is not None and ema120 is not None and close > ema120
@@ -365,8 +397,13 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                                 and kdj_k_prev <= kdj_d_prev
                                 and kdj_k > kdj_d
                             )
+                            cond5 = (
+                                kdj_k is not None
+                                and kdj_d is not None
+                                and kdj_k > kdj_d
+                            )
 
-                            if cond3:
+                            if cond1 and cond5:
                                 bullish_set.add(inst)
                                 if cond4:
                                     golden_set.add(inst)

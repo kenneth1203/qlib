@@ -9,6 +9,7 @@ import pandas as pd
 from typing import Dict, List, Text, Tuple, Union, Set, Optional
 from abc import ABC
 
+import qlib
 from qlib.data import D
 from qlib.data.dataset import Dataset
 from qlib.model.base import BaseModel
@@ -316,8 +317,8 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         rsi_overbought: float = 70.0,
         kdj_overbought: float = 80.0,
         kdj_oversold: float = 20.0,
-        #stop_loss_pct: float = 0.10,
-        stop_loss_pct: Optional[float] = None,
+        stop_loss_pct: float = 0.20,
+        #stop_loss_pct: Optional[float] = None,
         min_turnover: float = 0.001,
         #min_turnover: Optional[float] = None,
         allow_missing_shares: bool = True,
@@ -340,6 +341,10 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         self._issued_shares: Optional[pd.Series] = None
         self._issued_shares_loaded: bool = False
         self._turnover_cache: Dict[pd.Timestamp, pd.Series] = {}
+        self._turnover_cache_all: Optional[pd.Series] = None
+        self._turnover_cache_insts: Set[str] = set()
+        self._turnover_cache_start: Optional[pd.Timestamp] = None
+        self._turnover_cache_end: Optional[pd.Timestamp] = None
 
     def _load_issued_shares(self) -> pd.Series:
         if self._issued_shares_loaded:
@@ -388,25 +393,14 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
             trade_ts = pd.Timestamp(trade_date)
             turnover_all = self._turnover_cache.get(trade_ts)
             if turnover_all is None:
-                feat = D.features(
-                    D.instruments("all"),
-                    ["$volume"],
-                    start_time=trade_ts,
-                    end_time=trade_ts,
-                    freq="day",
-                    disk_cache=True,
-                )
-                if feat is None or feat.empty:
+                self._ensure_turnover_cache(list(instruments))
+                if self._turnover_cache_all is None:
                     return pd.Series(self.allow_missing_shares, index=pd.Index(instruments, name="instrument"))
-                if isinstance(feat.index, pd.MultiIndex):
-                    vol = feat["$volume"].groupby(level=0).tail(1)
-                    vol.index = vol.index.droplevel("datetime") if "datetime" in vol.index.names else vol.index
-                else:
-                    vol = feat["$volume"]
-                vol = vol.sort_index()
-                shares_all = shares.reindex(vol.index)
-                turnover_all = vol / shares_all
-                self._turnover_cache[trade_ts] = turnover_all
+                try:
+                    turnover_all = self._turnover_cache_all.xs(trade_ts, level="datetime")
+                    self._turnover_cache[trade_ts] = turnover_all
+                except Exception:
+                    return pd.Series(self.allow_missing_shares, index=pd.Index(instruments, name="instrument"))
 
             turnover = turnover_all.reindex(instruments)
             mask = turnover >= float(self.min_turnover)
@@ -418,8 +412,76 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         except Exception:
             return pd.Series(self.allow_missing_shares, index=pd.Index(instruments, name="instrument"))
 
+    def _ensure_turnover_cache(self, instruments: List[str]) -> Optional[pd.Series]:
+        insts = list(dict.fromkeys(instruments))
+        if not insts:
+            return None
+        if self._turnover_cache_all is None:
+            try:
+                trade_len = self.trade_calendar.get_trade_len()
+                start_ts = self.trade_calendar.get_step_time(0)[0]
+                end_ts = self.trade_calendar.get_step_time(trade_len - 1)[0]
+            except Exception:
+                start_ts = None
+                end_ts = None
+            self._turnover_cache_start = pd.Timestamp(start_ts) if start_ts is not None else None
+            self._turnover_cache_end = pd.Timestamp(end_ts) if end_ts is not None else None
+            feat = D.features(
+                insts,
+                ["$volume"],
+                start_time=self._turnover_cache_start,
+                end_time=self._turnover_cache_end,
+                freq="day",
+                disk_cache=True,
+            )
+            if feat is None or feat.empty:
+                return None
+            vol = pd.to_numeric(feat["$volume"], errors="coerce")
+            vol = vol.sort_index()
+            shares = self._load_issued_shares()
+            shares_all = shares.reindex(vol.index.get_level_values("instrument")).values
+            turnover = vol / shares_all
+            self._turnover_cache_all = turnover
+            self._turnover_cache_insts = set(insts)
+            return self._turnover_cache_all
+
+        missing = [i for i in insts if i not in self._turnover_cache_insts]
+        if missing:
+            feat = D.features(
+                missing,
+                ["$volume"],
+                start_time=self._turnover_cache_start,
+                end_time=self._turnover_cache_end,
+                freq="day",
+                disk_cache=True,
+            )
+            if feat is not None and not feat.empty:
+                vol = pd.to_numeric(feat["$volume"], errors="coerce")
+                vol = vol.sort_index()
+                shares = self._load_issued_shares()
+                shares_all = shares.reindex(vol.index.get_level_values("instrument")).values
+                turnover = vol / shares_all
+                self._turnover_cache_all = pd.concat([self._turnover_cache_all, turnover], axis=0)
+                self._turnover_cache_insts.update(missing)
+        return self._turnover_cache_all
+
     def _ensure_macd_cache(self, instruments: List[str]) -> Optional[pd.DataFrame]:
-        fields = ["$DIF", "$DEA", "$DIF_PREV", "$DEA_PREV", "$RSI", "$KDJ_K", "$KDJ_D"]
+        fields = [
+            "$DIF",
+            "$DEA",
+            "$MACD",
+            "$RSI",
+            "$KDJ_K",
+            "$KDJ_D",
+            "$KDJ_J",
+            "$MFI",
+            "$ROC",
+            "$EMA5",
+            "$EMA10",
+            "$EMA20",
+            "$EMA60",
+            "$EMA120",
+        ]
         insts = list(dict.fromkeys(instruments))
         if not insts:
             return None
@@ -484,8 +546,8 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                             prev_row = sub_inst.iloc[-2] if len(sub_inst) >= 2 else None
                             dif = float(row.get("$DIF")) if "$DIF" in row else None
                             dea = float(row.get("$DEA")) if "$DEA" in row else None
-                            dif_prev = float(row.get("$DIF_PREV")) if "$DIF_PREV" in row else None
-                            dea_prev = float(row.get("$DEA_PREV")) if "$DEA_PREV" in row else None
+                            dif_prev = float(prev_row.get("$DIF")) if prev_row is not None and "$DIF" in prev_row else None
+                            dea_prev = float(prev_row.get("$DEA")) if prev_row is not None and "$DEA" in prev_row else None
                             rsi = float(row.get("$RSI")) if "$RSI" in row else None
                             kdj_k = float(row.get("$KDJ_K")) if "$KDJ_K" in row else None
                             kdj_d = float(row.get("$KDJ_D")) if "$KDJ_D" in row else None
@@ -500,13 +562,8 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                         if None in (dif, dea, dif_prev, dea_prev):
                             continue
                         macd_buy = (
-                            dif_prev <= dea_prev
-                            and dif > dea
+                            dif > dea
                             and dif > 0
-                            and not (
-                                (rsi is not None and rsi >= self.rsi_overbought)
-                                or (kdj_k is not None and kdj_k >= self.kdj_overbought)
-                            )
                         )
                         bottom_buy = (
                             dif_prev <= dea_prev
@@ -526,9 +583,6 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                             and kdj_d is not None
                             and kdj_k_prev is not None
                             and kdj_d_prev is not None
-                            and dif is not None
-                            and dif > 0
-                            and not (rsi is not None and rsi >= self.rsi_overbought)
                             and kdj_k_prev <= kdj_d_prev
                             and kdj_k > kdj_d
                         )

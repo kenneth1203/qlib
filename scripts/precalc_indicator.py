@@ -47,14 +47,14 @@ def _compute_indicators_for_instrument(sub: pd.DataFrame) -> pd.DataFrame:
     dea = dif.ewm(span=9, adjust=False).mean()
     out["DIF"] = dif
     out["DEA"] = dea
-    out["MACD"] = dif - dea
-    # RSI(6)
+    out["MACD"] = (dif - dea) * 2
+    # RSI(6) using EMA-like smoothing
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(window=6, min_periods=3).mean()
-    avg_loss = loss.rolling(window=6, min_periods=3).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    avg_gain = gain.ewm(alpha=1 / 6, min_periods=6, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 6, min_periods=6, adjust=False).mean()
+    rs = avg_gain / avg_loss
     out["RSI"] = 100 - (100 / (1 + rs))
 
     # KDJ(9)
@@ -95,8 +95,12 @@ def _compute_indicators_for_instrument(sub: pd.DataFrame) -> pd.DataFrame:
 def _compute_indicators_from_source_df(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
     if "date" in work.columns:
-        work["date"] = pd.to_datetime(work["date"])
+        work["date"] = pd.to_datetime(work["date"], errors="coerce")
         work = work.set_index("date")
+    required = {"close", "high", "low", "volume"}
+    if not required.issubset(set(work.columns)):
+        missing = ", ".join(sorted(required - set(work.columns)))
+        raise ValueError(f"missing required columns: {missing}")
     work = work.rename(
         columns={
             "close": "$close",
@@ -125,14 +129,23 @@ def precalc_inplace(indicator_dir: str):
             base_df = pd.read_csv(src_file)
             if base_df.empty:
                 continue
+            if "date" not in base_df.columns:
+                print(f"Skip {src_file.name}: missing date column")
+                continue
+            base_df["date"] = pd.to_datetime(base_df["date"], errors="coerce")
+            base_df = base_df.dropna(subset=["date"])
+            if base_df.empty:
+                continue
             if "symbol" not in base_df.columns:
                 base_df.insert(0, "symbol", src_file.stem)
 
             base_df = base_df.drop(columns=[c for c in FIELDS if c in base_df.columns])
             ind_df = _compute_indicators_from_source_df(base_df)
-            merge_cols = ["symbol", "date"] if "symbol" in base_df.columns else ["date"]
+            merge_cols = ["date"]
             ind_cols = [c for c in ind_df.columns if c not in merge_cols]
             merged_df = base_df.merge(ind_df[merge_cols + ind_cols], on=merge_cols, how="left")
+            if "date" in merged_df.columns:
+                merged_df["date"] = merged_df["date"].dt.strftime("%Y-%m-%d")
 
             ordered_cols = [
                 col

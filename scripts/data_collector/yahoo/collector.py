@@ -851,7 +851,7 @@ class YahooNormalize1d(YahooNormalize, ABC):
             return df.reset_index()
     
         # Convert numeric columns (except symbol/adjclose/change and indicators) to numeric safely, then apply adjustments
-        indicator_prefixes = ("DIF", "DEA", "MACD", "RSI", "KDJ", "EMA")
+        indicator_prefixes = ("DIF", "DEA", "MACD", "RSI", "KDJ", "EMA", "MFI", "ROC")
         for _col in df.columns:
             if _col in [self._symbol_field_name, "adjclose", "change"]:
                 continue
@@ -1334,6 +1334,8 @@ class Run(BaseRun):
         delay: float = 1,
         exists_skip: bool = True,
         skip_download: bool = False,
+        indicator: bool = True,
+        week_data: bool = True,
     ):
         """update yahoo data to bin
 
@@ -1445,20 +1447,35 @@ class Run(BaseRun):
                         )
             except Exception:
                 pass
-        # For HK 1d: compute indicators on source CSVs before normalization
-        if self.region.lower() == "hk" and self.interval.lower() == "1d":
+        # For HK 1d: compute indicators into hk_data_indicator before normalization
+        indicator_dir = None
+        if indicator and self.region.lower() == "hk" and self.interval.lower() == "1d":
             try:
-                self._update_hk_source_indicators(trading_date)
+                src_dir = Path(self.source_dir).expanduser().resolve()
+                indicator_dir = src_dir.parent.joinpath("hk_data_indicator")
+                logger.info(
+                    f"indicator=True: updating indicators from {src_dir} into {indicator_dir} for {trading_date}"
+                )
+                self._update_hk_indicator_data(trading_date, src_dir, indicator_dir, require_latest_date=True)
             except Exception as e:
                 logger.warning(f"HK indicator update failed: {e}")
+        else:
+            logger.info("indicator=False: skip indicator update")
         # NOTE: a larger max_workers setting here would be faster
         self.max_workers = (
             max(multiprocessing.cpu_count() - 2, 1)
             if self.max_workers is None or self.max_workers <= 1
             else self.max_workers
         )
-        # normalize data
-        self.normalize_data_1d_extend(qlib_data_1d_dir)
+        # normalize data (use hk_data_indicator if indicator enabled)
+        src_dir_orig = self.source_dir
+        try:
+            if indicator and indicator_dir is not None:
+                self.source_dir = str(indicator_dir)
+            logger.info(f"normalize source_dir={self.source_dir}")
+            self.normalize_data_1d_extend(qlib_data_1d_dir)
+        finally:
+            self.source_dir = src_dir_orig
 
         # dump bin
         _dump = DumpDataUpdate(
@@ -1468,6 +1485,49 @@ class Run(BaseRun):
             max_workers=self.max_workers,
         )
         _dump.dump()
+
+        # Resample latest day to weekly/monthly/yearly source folders and dump bins
+        if week_data and self.region.lower() == "hk" and self.interval.lower() == "1d":
+            try:
+                src_dir = Path(src_dir_orig).expanduser().resolve()
+                base_dir = src_dir.parent
+                w_dir = base_dir.joinpath("hk_data_1w")
+                m_dir = base_dir.joinpath("hk_data_1mo")
+                y_dir = base_dir.joinpath("hk_data_1y")
+                w_ind_dir = base_dir.joinpath("hk_data_1w_indicator")
+                m_ind_dir = base_dir.joinpath("hk_data_1mo_indicator")
+                y_ind_dir = base_dir.joinpath("hk_data_1y_indicator")
+                logger.info(
+                    f"week_data=True: resample latest {trading_date} from {src_dir} into {w_dir}, {m_dir}, {y_dir}"
+                )
+                self._resample_latest_to_dir(src_dir, w_dir, trading_date, "W-MON")
+                self._resample_latest_to_dir(src_dir, m_dir, trading_date, "MS")
+                self._resample_latest_to_dir(src_dir, y_dir, trading_date, "YS-JAN")
+
+                if indicator:
+                    logger.info(
+                        "week_data=True: updating indicators for latest week/month/year into indicator folders"
+                    )
+                    self._update_hk_indicator_data(trading_date, w_dir, w_ind_dir, require_latest_date=False)
+                    self._update_hk_indicator_data(trading_date, m_dir, m_ind_dir, require_latest_date=False)
+                    self._update_hk_indicator_data(trading_date, y_dir, y_ind_dir, require_latest_date=False)
+
+                qlib_root = Path("C:/Users/kennethlao/.qlib/qlib_data")
+                logger.info(
+                    f"week_data=True: dumping bins to {qlib_root.joinpath('hk_data_1w')}, {qlib_root.joinpath('hk_data_1m')}, {qlib_root.joinpath('hk_data_1y')}"
+                )
+                if indicator:
+                    self._dump_dir(w_ind_dir, qlib_root.joinpath("hk_data_1w"))
+                    self._dump_dir(m_ind_dir, qlib_root.joinpath("hk_data_1mo"))
+                    self._dump_dir(y_ind_dir, qlib_root.joinpath("hk_data_1y"))
+                else:
+                    self._dump_dir(w_dir, qlib_root.joinpath("hk_data_1w"))
+                    self._dump_dir(m_dir, qlib_root.joinpath("hk_data_1mo"))
+                    self._dump_dir(y_dir, qlib_root.joinpath("hk_data_1y"))
+            except Exception as e:
+                logger.warning(f"HK weekly/monthly/yearly update failed: {e}")
+        else:
+            logger.info("week_data=False: skip resample and weekly/monthly/yearly dump")
 
         # parse index
         _region = self.region.lower()
@@ -1488,39 +1548,54 @@ class Run(BaseRun):
         if "close" not in df.columns:
             return df
         s_close = pd.to_numeric(df["close"], errors="coerce")
+        s_high = pd.to_numeric(df.get("high"), errors="coerce")
+        s_low = pd.to_numeric(df.get("low"), errors="coerce")
+        s_vol = pd.to_numeric(df.get("volume"), errors="coerce")
 
+        # MACD 12/26/9
         ema_fast = s_close.ewm(span=12, adjust=False).mean()
         ema_slow = s_close.ewm(span=26, adjust=False).mean()
         dif = ema_fast - ema_slow
         dea = dif.ewm(span=9, adjust=False).mean()
-        macd = 2 * (dif - dea)
-
         df["DIF"] = dif
         df["DEA"] = dea
-        df["MACD"] = macd
-        df["DIF_PREV"] = dif.shift(1)
-        df["DEA_PREV"] = dea.shift(1)
+        df["MACD"] = (dif - dea) * 2
 
-        # RSI(14)
+        # RSI(6) EMA-like smoothing
         delta = s_close.diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = -delta.where(delta < 0, 0.0)
-        avg_gain = gain.rolling(14, min_periods=14).mean()
-        avg_loss = loss.rolling(14, min_periods=14).mean()
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        rsi = 100 - (100 / (1 + rs))
-        df["RSI"] = rsi
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1 / 6, min_periods=6, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / 6, min_periods=6, adjust=False).mean()
+        rs = avg_gain / avg_loss
+        df["RSI"] = 100 - (100 / (1 + rs))
 
         # KDJ(9)
-        low_n = pd.to_numeric(df.get("low"), errors="coerce").rolling(9, min_periods=9).min()
-        high_n = pd.to_numeric(df.get("high"), errors="coerce").rolling(9, min_periods=9).max()
-        rsv = (s_close - low_n) / (high_n - low_n) * 100
+        low_n = s_low.rolling(9, min_periods=4).min()
+        high_n = s_high.rolling(9, min_periods=4).max()
+        rsv = (s_close - low_n) / (high_n - low_n)
+        rsv = rsv.replace([np.inf, -np.inf], np.nan) * 100
         k = rsv.ewm(alpha=1 / 3, adjust=False).mean()
         d = k.ewm(alpha=1 / 3, adjust=False).mean()
         j = 3 * k - 2 * d
         df["KDJ_K"] = k
         df["KDJ_D"] = d
         df["KDJ_J"] = j
+
+        # MFI(14)
+        tp = (s_high + s_low + s_close) / 3.0
+        mf = tp * s_vol
+        tp_prev = tp.shift(1)
+        pos_mf = mf.where(tp > tp_prev, 0.0)
+        neg_mf = mf.where(tp < tp_prev, 0.0)
+        pos_sum = pos_mf.rolling(window=14, min_periods=7).sum()
+        neg_sum = neg_mf.rolling(window=14, min_periods=7).sum()
+        mfr = pos_sum / neg_sum.replace(0, np.nan)
+        df["MFI"] = 100 - (100 / (1 + mfr))
+
+        # ROC(10)
+        roc_n = 10
+        df["ROC"] = (s_close - s_close.shift(roc_n)) / s_close.shift(roc_n).replace(0, np.nan) * 100
 
         # EMA family
         df["EMA5"] = s_close.ewm(span=5, adjust=False).mean()
@@ -1529,21 +1604,25 @@ class Run(BaseRun):
         df["EMA60"] = s_close.ewm(span=60, adjust=False).mean()
         df["EMA120"] = s_close.ewm(span=120, adjust=False).mean()
 
-        return df
+        return df.fillna(0.0)
 
-    def _update_hk_source_indicators(self, trading_date: str):
-        src_dir = Path(self.source_dir).expanduser()
-        if not src_dir.exists():
-            logger.warning(f"HK source_dir not found: {src_dir}")
+    def _update_hk_indicator_data(
+        self, trading_date: str, source_dir: Path, indicator_dir: Path, require_latest_date: bool = True
+    ):
+        if not source_dir.exists():
+            logger.warning(f"HK source_dir not found: {source_dir}")
             return
-        try:
-            trading_ts = pd.to_datetime(trading_date)
-        except Exception:
-            trading_ts = None
+        indicator_dir.mkdir(parents=True, exist_ok=True)
+        trading_ts = None
+        if require_latest_date:
+            try:
+                trading_ts = pd.to_datetime(trading_date)
+            except Exception:
+                trading_ts = None
 
-        csv_list = list(src_dir.glob("*.csv"))
+        csv_list = list(source_dir.glob("*.csv"))
         if not csv_list:
-            logger.warning(f"No source CSVs found in {src_dir}")
+            logger.warning(f"No source CSVs found in {source_dir}")
             return
 
         for csv_path in csv_list:
@@ -1552,7 +1631,10 @@ class Run(BaseRun):
                 if df.empty or "date" not in df.columns:
                     continue
                 df["date"] = pd.to_datetime(df["date"], errors="coerce")
-                if trading_ts is not None:
+                df = df.dropna(subset=["date"])
+                if df.empty:
+                    continue
+                if require_latest_date and trading_ts is not None:
                     if df["date"].dropna().max() is None:
                         continue
                     if df["date"].dropna().max() < trading_ts:
@@ -1560,9 +1642,82 @@ class Run(BaseRun):
                 df = df.sort_values("date").reset_index(drop=True)
                 df = self._calc_indicators(df)
                 df["date"] = df["date"].dt.strftime("%Y-%m-%d")
-                df.to_csv(csv_path, index=False)
+                out_path = indicator_dir.joinpath(csv_path.name)
+                df.to_csv(out_path, index=False)
             except Exception as e:
                 logger.warning(f"Indicator calc failed for {csv_path}: {e}")
+
+    def _resample_latest_to_dir(self, src_dir: Path, dst_dir: Path, trading_date: str, freq: str):
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            trading_ts = pd.to_datetime(trading_date)
+        except Exception:
+            return
+        for csv_path in src_dir.glob("*.csv"):
+            try:
+                df = pd.read_csv(csv_path)
+                if df is None or df.empty or "date" not in df.columns:
+                    continue
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                df = df.dropna(subset=["date"])
+                if df.empty:
+                    continue
+                df = df.sort_values("date")
+                df = df[df["date"] <= trading_ts]
+                if df.empty:
+                    continue
+
+                if freq == "W-MON":
+                    # Week starts on Monday; merge all days in the same Mon-Sun week.
+                    week_start = trading_ts - pd.Timedelta(days=trading_ts.weekday())
+                    start_ts = week_start.normalize()
+                    end_ts = start_ts + pd.Timedelta(days=6, hours=23, minutes=59, seconds=59, milliseconds=999)
+                elif freq == "MS":
+                    period = trading_ts.to_period("M")
+                    start_ts = period.start_time
+                    end_ts = period.end_time
+                elif freq == "YS-JAN":
+                    period = trading_ts.to_period("Y")
+                    start_ts = period.start_time
+                    end_ts = period.end_time
+                else:
+                    continue
+
+                seg = df[(df["date"] >= start_ts) & (df["date"] <= end_ts)]
+                if seg.empty:
+                    continue
+
+                out_row = {
+                    "symbol": seg["symbol"].iloc[0] if "symbol" in seg.columns else csv_path.stem,
+                    "date": start_ts.strftime("%Y-%m-%d"),
+                    "open": pd.to_numeric(seg["open"], errors="coerce").iloc[0],
+                    "high": pd.to_numeric(seg["high"], errors="coerce").max(),
+                    "low": pd.to_numeric(seg["low"], errors="coerce").min(),
+                    "close": pd.to_numeric(seg["close"], errors="coerce").iloc[-1],
+                    "volume": pd.to_numeric(seg["volume"], errors="coerce").sum(),
+                }
+                out_df = pd.DataFrame([out_row])
+                out_path = dst_dir.joinpath(csv_path.name)
+                if out_path.exists():
+                    prev = pd.read_csv(out_path)
+                    if "date" in prev.columns:
+                        prev = prev[prev["date"].astype(str) != out_row["date"]]
+                    out_df = pd.concat([prev, out_df], ignore_index=True)
+                out_df = out_df.sort_values("date")
+                out_df.to_csv(out_path, index=False)
+            except Exception as e:
+                logger.warning(f"Resample failed for {csv_path}: {e}")
+
+    def _dump_dir(self, data_path: Path, qlib_dir: Path):
+        if not data_path.exists():
+            return
+        _dump = DumpDataUpdate(
+            data_path=str(data_path),
+            qlib_dir=str(qlib_dir),
+            exclude_fields="symbol,date",
+            max_workers=self.max_workers,
+        )
+        _dump.dump()
 
 
 if __name__ == "__main__":
