@@ -328,7 +328,7 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                     start_dt = (pd.to_datetime(target_day) - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
                     feat = D.features(
                         cand_insts,
-                        ["$close", "$EMA120", "$DIF", "$DEA", "$KDJ_K", "$KDJ_D"],
+                        ["$close", "$EMA120", "$DIF", "$DEA", "$MACD", "$KDJ_K", "$KDJ_D"],
                         start_time=start_dt,
                         end_time=target_day,
                         freq="day",
@@ -377,6 +377,17 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                                 kdj_d = float(row.get("$KDJ_D")) if "$KDJ_D" in row else None
                                 kdj_k_prev = float(prev_row.get("$KDJ_K")) if prev_row is not None and "$KDJ_K" in prev_row else None
                                 kdj_d_prev = float(prev_row.get("$KDJ_D")) if prev_row is not None and "$KDJ_D" in prev_row else None
+
+                                # MACD decline check: exclude if MACD has declined for two consecutive prior bars
+                                macd = float(sub_inst.iloc[-1].get("$MACD")) if "$MACD" in sub_inst.columns else None
+                                macd_prev = float(sub_inst.iloc[-2].get("$MACD")) if len(sub_inst) >= 2 and "$MACD" in sub_inst.columns else None
+                                macd_prev2 = float(sub_inst.iloc[-3].get("$MACD")) if len(sub_inst) >= 3 and "$MACD" in sub_inst.columns else None
+                                macd_down_2 = (
+                                    macd is not None
+                                    and macd_prev is not None
+                                    and macd_prev2 is not None
+                                    and macd < macd_prev < macd_prev2
+                                )
                             except Exception:
                                 close = ema120 = dif = dea = kdj_k = kdj_d = kdj_k_prev = kdj_d_prev = None
 
@@ -386,7 +397,7 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                             if inst in weekly_map:
                                 weekly_dif, weekly_dea = weekly_map.get(inst, (None, None))
 
-                            cond1 = weekly_dif is not None and weekly_dea is not None and weekly_dif > 0 and weekly_dea > 0
+                            cond1 = weekly_dif is not None and weekly_dea is not None and weekly_dif > 0
                             cond2 = close is not None and ema120 is not None and close > ema120
                             cond3 = dif is not None and dea is not None and dif > dea
                             cond4 = (
@@ -403,7 +414,7 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                                 and kdj_k > kdj_d
                             )
 
-                            if cond1 and cond5:
+                            if cond1 and cond5 and not macd_down_2:
                                 bullish_set.add(inst)
                                 if cond4:
                                     golden_set.add(inst)
@@ -433,15 +444,17 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                     base = D.features(selected, ["$close", "$volume"], start_time=start_dt, end_time=target_day, freq="day")
                     base.columns = ["$close", "$volume"]
 
-                    def _tail_mean_dollar(df):
+                    # Use 20-day median dollar volume (turnover) instead of long-window mean
+                    turnover_window = 20
+                    def _tail_median_dollar(df):
                         df2 = df.dropna()
                         if df2.empty:
                             return 0.0
-                        dv = (df2["$close"] * df2["$volume"]).tail(liq_window)
-                        return float(dv.mean()) if len(dv) > 0 else 0.0
+                        dv = (df2["$close"] * df2["$volume"]).tail(turnover_window)
+                        return float(dv.median()) if len(dv) > 0 else 0.0
 
                     vol_map = (
-                        base.groupby(level="instrument").apply(_tail_mean_dollar).to_dict()
+                        base.groupby(level="instrument").apply(_tail_median_dollar).to_dict()
                     )
             except Exception:
                 vol_map = {}

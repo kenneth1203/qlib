@@ -300,7 +300,9 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
     """TopkDropout with MACD-based buy/sell gating.
 
     - Buy when DIF crosses above DEA and DIF>0 (bullish) and rank by score.
+    - Weekly MACD filter: buy only if weekly DIF>0 and DEA>0 for the current week.
     - Sell when DIF crosses below DEA and DIF<0 (bearish), capped by n_drop.
+    - Sell when MFI is overbought and DIF>0 and DEA>0.
     - If no bullish candidates, do nothing (keep current holdings; do not force-fill topk).
     - If bullish candidates exist, attempt swaps using available bearish names; do not force fill beyond available bullish names.
     - Other behaviors (tradable check, hold_thresh, limit handling) follow TopkDropoutStrategy.
@@ -315,6 +317,7 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         macd_slow: int = 26,
         macd_signal: int = 9,
         rsi_overbought: float = 70.0,
+        mfi_overbought: float = 80.0,
         kdj_overbought: float = 80.0,
         kdj_oversold: float = 20.0,
         stop_loss_pct: float = 0.20,
@@ -322,6 +325,7 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         min_turnover: float = 0.001,
         #min_turnover: Optional[float] = None,
         allow_missing_shares: bool = True,
+        weekly_provider_uri: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(topk=topk, n_drop=n_drop, **kwargs)
@@ -329,11 +333,13 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         self.macd_slow = macd_slow
         self.macd_signal = macd_signal
         self.rsi_overbought = rsi_overbought
+        self.mfi_overbought = mfi_overbought
         self.kdj_overbought = kdj_overbought
         self.kdj_oversold = kdj_oversold
         self.stop_loss_pct = stop_loss_pct
         self.min_turnover = min_turnover
         self.allow_missing_shares = allow_missing_shares
+        self.weekly_provider_uri = weekly_provider_uri
         self._macd_feat_cache: Optional[pd.DataFrame] = None
         self._macd_cache_insts: Set[str] = set()
         self._macd_cache_start: Optional[pd.Timestamp] = None
@@ -345,6 +351,11 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         self._turnover_cache_insts: Set[str] = set()
         self._turnover_cache_start: Optional[pd.Timestamp] = None
         self._turnover_cache_end: Optional[pd.Timestamp] = None
+        self._weekly_feat_cache: Optional[pd.DataFrame] = None
+        self._weekly_cache_insts: Set[str] = set()
+        self._weekly_cache_start: Optional[pd.Timestamp] = None
+        self._weekly_cache_end: Optional[pd.Timestamp] = None
+        self._weekly_cache_ready: bool = False
 
     def _load_issued_shares(self) -> pd.Series:
         if self._issued_shares_loaded:
@@ -473,14 +484,7 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
             "$RSI",
             "$KDJ_K",
             "$KDJ_D",
-            "$KDJ_J",
             "$MFI",
-            "$ROC",
-            "$EMA5",
-            "$EMA10",
-            "$EMA20",
-            "$EMA60",
-            "$EMA120",
         ]
         insts = list(dict.fromkeys(instruments))
         if not insts:
@@ -524,7 +528,101 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                 self._macd_feat_cache = pd.concat([self._macd_feat_cache, df_new], axis=0)
                 self._macd_cache_insts.update(missing)
         return self._macd_feat_cache
+    """
+    def _calc_weekly_dif_dea(self, close_s: pd.Series) -> Tuple[pd.Series, pd.Series]:
+        close_s = pd.to_numeric(close_s, errors="coerce")
+        ema_fast = close_s.ewm(span=self.macd_fast, adjust=False).mean()
+        ema_slow = close_s.ewm(span=self.macd_slow, adjust=False).mean()
+        dif = ema_fast - ema_slow
+        dea = dif.ewm(span=self.macd_signal, adjust=False).mean()
+        return dif, dea
 
+    def _ensure_weekly_cache(self, instruments: List[str]) -> Optional[pd.DataFrame]:
+        insts = list(dict.fromkeys(instruments))
+        if not insts:
+            return None
+        if not self.weekly_provider_uri:
+            raise ValueError("weekly_provider_uri is required for weekly MACD gating")
+
+        def _fetch_weekly(inst_list: List[str]) -> Optional[pd.DataFrame]:
+            if not inst_list:
+                return None
+            try:
+                from qlib.config import C
+
+                orig_provider = getattr(C, "provider_uri", None)
+                orig_region = getattr(C, "region", None)
+            except Exception:
+                orig_provider = None
+                orig_region = None
+
+            switched = False
+            try:
+                if orig_provider != self.weekly_provider_uri:
+                    qlib.init(provider_uri=self.weekly_provider_uri, region=orig_region)
+                    switched = True
+                df = D.features(
+                    inst_list,
+                    ["$close"],
+                    start_time=self._weekly_cache_start,
+                    end_time=self._weekly_cache_end,
+                    freq="week",
+                    disk_cache=True,
+                )
+                if df is None or df.empty:
+                    raise RuntimeError("weekly data not found")
+                return df
+            finally:
+                if switched and orig_provider is not None:
+                    try:
+                        qlib.init(provider_uri=orig_provider, region=orig_region)
+                    except Exception:
+                        pass
+
+        if self._weekly_feat_cache is None:
+            try:
+                trade_len = self.trade_calendar.get_trade_len()
+                start_ts = self.trade_calendar.get_step_time(0)[0]
+                end_ts = self.trade_calendar.get_step_time(trade_len - 1)[0]
+            except Exception:
+                start_ts = None
+                end_ts = None
+            self._weekly_cache_start = pd.Timestamp(start_ts) if start_ts is not None else None
+            self._weekly_cache_end = pd.Timestamp(end_ts) if end_ts is not None else None
+            df = _fetch_weekly(insts)
+            self._weekly_feat_cache = df
+            self._weekly_cache_insts = set(insts)
+            self._weekly_cache_ready = True
+        else:
+            missing = [i for i in insts if i not in self._weekly_cache_insts]
+            if missing:
+                df_new = _fetch_weekly(missing)
+                self._weekly_feat_cache = pd.concat([self._weekly_feat_cache, df_new], axis=0)
+                self._weekly_cache_insts.update(missing)
+
+        if self._weekly_feat_cache is None or self._weekly_feat_cache.empty:
+            raise RuntimeError("weekly data not found")
+
+        if "$DIF" not in self._weekly_feat_cache.columns or "$DEA" not in self._weekly_feat_cache.columns:
+            self._weekly_feat_cache["$DIF"] = np.nan
+            self._weekly_feat_cache["$DEA"] = np.nan
+
+        try:
+            df_all = self._weekly_feat_cache
+            if isinstance(df_all.index, pd.MultiIndex):
+                for inst, sub in df_all.groupby(level=0):
+                    sub_inst = sub.droplevel(0)
+                    if "$close" not in sub_inst.columns:
+                        continue
+                    dif_s, dea_s = self._calc_weekly_dif_dea(sub_inst["$close"])
+                    df_all.loc[(inst, sub_inst.index), "$DIF"] = dif_s.values
+                    df_all.loc[(inst, sub_inst.index), "$DEA"] = dea_s.values
+                self._weekly_feat_cache = df_all
+        except Exception:
+            pass
+
+        return self._weekly_feat_cache
+    """
     def _compute_macd_flags(self, instruments: List[str], end_time) -> Dict[str, Dict[str, bool]]:
         # 1) Try precomputed bin features (DIF/DEA/DIF_PREV/DEA_PREV) from D.features
         if instruments:
@@ -533,6 +631,25 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                 df_all = self._ensure_macd_cache(instruments)
                 if df_all is None or df_all.empty:
                     return {}
+                #weekly_map: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+                """
+                weekly_df = self._ensure_weekly_cache(instruments)
+                if weekly_df is not None and not weekly_df.empty and isinstance(weekly_df.index, pd.MultiIndex):
+                    for inst, w_sub in weekly_df.groupby(level=0):
+                        try:
+                            w_inst = w_sub.droplevel(0)
+                            if isinstance(w_inst.index, pd.DatetimeIndex):
+                                w_inst = w_inst[w_inst.index <= end_ts]
+                            if w_inst.empty:
+                                continue
+                            w_row = w_inst.iloc[-1]
+                            w_dif = float(w_row.get("$DIF")) if "$DIF" in w_row else None
+                            w_dea = float(w_row.get("$DEA")) if "$DEA" in w_row else None
+                            weekly_map[inst] = (w_dif, w_dea)
+                        except Exception:
+                            print("Error computing weekly DIF/DEA for inst:", inst)
+                            continue
+                """
                 if isinstance(df_all, pd.DataFrame) and not df_all.empty and isinstance(df_all.index, pd.MultiIndex):
                     flags: Dict[str, Dict[str, bool]] = {}
                     for inst, sub in df_all.groupby(level=0):
@@ -544,13 +661,24 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                                 continue
                             row = sub_inst.iloc[-1]
                             prev_row = sub_inst.iloc[-2] if len(sub_inst) >= 2 else None
+                            prev_row2 = sub_inst.iloc[-3] if len(sub_inst) >= 3 else None
+                            prev_row3 = sub_inst.iloc[-4] if len(sub_inst) >= 4 else None
                             dif = float(row.get("$DIF")) if "$DIF" in row else None
                             dea = float(row.get("$DEA")) if "$DEA" in row else None
                             dif_prev = float(prev_row.get("$DIF")) if prev_row is not None and "$DIF" in prev_row else None
                             dea_prev = float(prev_row.get("$DEA")) if prev_row is not None and "$DEA" in prev_row else None
+                            macd = float(row.get("$MACD")) if "$MACD" in row else None
+                            macd_prev = float(prev_row.get("$MACD")) if prev_row is not None and "$MACD" in prev_row else None
+                            macd_prev2 = (
+                                float(prev_row2.get("$MACD")) if prev_row2 is not None and "$MACD" in prev_row2 else None
+                            )
+                            macd_prev3 = (
+                                float(prev_row3.get("$MACD")) if prev_row3 is not None and "$MACD" in prev_row3 else None
+                            )
                             rsi = float(row.get("$RSI")) if "$RSI" in row else None
                             kdj_k = float(row.get("$KDJ_K")) if "$KDJ_K" in row else None
                             kdj_d = float(row.get("$KDJ_D")) if "$KDJ_D" in row else None
+                            mfi = float(row.get("$MFI")) if "$MFI" in row else None
                             kdj_k_prev = (
                                 float(prev_row.get("$KDJ_K")) if prev_row is not None and "$KDJ_K" in prev_row else None
                             )
@@ -558,27 +686,32 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                                 float(prev_row.get("$KDJ_D")) if prev_row is not None and "$KDJ_D" in prev_row else None
                             )
                         except Exception:
-                            dif = dea = dif_prev = dea_prev = rsi = kdj_k = kdj_d = kdj_k_prev = kdj_d_prev = None
+                            dif = dea = dif_prev = dea_prev = rsi = kdj_k = kdj_d = mfi = kdj_k_prev = kdj_d_prev = None
+                            macd = macd_prev = macd_prev2 = macd_prev3 = None
                         if None in (dif, dea, dif_prev, dea_prev):
                             continue
+                        #weekly_dif, weekly_dea = weekly_map.get(inst, (None, None))
+                        #weekly_ok = weekly_dif is not None and weekly_dea is not None and weekly_dif > 0
+                        macd_down_2 = (
+                            macd is not None
+                            and macd_prev is not None
+                            and macd_prev2 is not None
+                            and macd < macd_prev < macd_prev2
+                        )
                         macd_buy = (
                             dif > dea
                             and dif > 0
+                            and kdj_k > kdj_d
+                            and not macd_down_2
                         )
-                        bottom_buy = (
-                            dif_prev <= dea_prev
-                            and dif > dea
-                            and dif < 0
-                            and kdj_k is not None
+                        kdj_buy = (
+                            kdj_k is not None
                             and kdj_d is not None
-                            and kdj_k_prev is not None
                             and kdj_k_prev <= self.kdj_oversold
                             and kdj_k > kdj_d
-                            and kdj_k > self.kdj_oversold
                         )
-                        #temp disable bottom buy
-                        bottom_buy = False
-                        kdj_buy = (
+
+                        kdj_golden_buy = (
                             kdj_k is not None
                             and kdj_d is not None
                             and kdj_k_prev is not None
@@ -586,18 +719,26 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                             and kdj_k_prev <= kdj_d_prev
                             and kdj_k > kdj_d
                         )
-                        buy = macd_buy or kdj_buy or bottom_buy
+                        #buy = (macd_buy or kdj_golden_buy or kdj_buy) and weekly_ok
+                        buy = macd_buy 
                         macd_sell = dif_prev >= dea_prev and dif < dea and (rsi is not None and rsi >= self.rsi_overbought)
-                        kdj_sell = (
+                        kdj_golden_sell = (
                             kdj_k is not None
                             and kdj_d is not None
                             and kdj_k_prev is not None
                             and kdj_d_prev is not None
-                            and kdj_k >= self.kdj_overbought
+                            and kdj_k_prev >= self.kdj_overbought
                             and kdj_k_prev >= kdj_d_prev
                             and kdj_k < kdj_d
                         )
-                        sell = macd_sell or kdj_sell
+                        mfi_sell = (
+                            mfi is not None
+                            and mfi >= self.mfi_overbought
+                            and dif > 0
+                            and dea > 0
+                        )
+                        #sell = macd_sell or kdj_golden_sell or mfi_sell
+                        sell=[]
                         flags[inst] = {"buy": bool(buy), "sell": bool(sell)}
                     return flags
             except Exception:

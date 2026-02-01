@@ -57,6 +57,19 @@ if __name__ == "__main__":
     GetData().qlib_data(target_dir=provider_uri, region=REG_HK, exists_skip=True)
     qlib.init(provider_uri=provider_uri, region=REG_HK)
 
+    # Align instruments with backtest (instrument_filtered.csv)
+    try:
+        csv_path = os.path.abspath(os.path.join(os.getcwd(), "instrument_filtered.csv"))
+        if os.path.exists(csv_path):
+            df = pd.read_csv(csv_path)
+            if not df.empty:
+                inst_col = "instrument" if "instrument" in df.columns else df.columns[0]
+                keep_insts = df[inst_col].astype(str).tolist()
+                if keep_insts:
+                    HK_GBDT_TASK["dataset"]["kwargs"]["handler"]["kwargs"]["instruments"] = keep_insts
+    except Exception:
+        pass
+
     dataset = init_instance_by_config(HK_GBDT_TASK["dataset"])
 
     # Auto-detect latest recorder_id from ./mlruns and use it
@@ -96,8 +109,9 @@ if __name__ == "__main__":
     # risk analysis graphs
     risk_figs = analysis_position.risk_analysis_graph(analysis_df, report_normal_df, show_notebook=False) or []
 
-    # Top50 most profitable stocks (approx by position value change)
+    # Per-stock trade summary & per-trade details
     pos_figs = []
+    html_blocks = []
     trade_df = pd.DataFrame()
     try:
         pos_obj = positions
@@ -231,6 +245,11 @@ if __name__ == "__main__":
                             if s_val not in (0, float("nan")):
                                 cost = abs(s_val)
                                 rate = (pnl / s_val) if s_val else float("nan")
+                        hold_days = None
+                        try:
+                            hold_days = (pd.to_datetime(e_dt) - pd.to_datetime(s_dt)).days
+                        except Exception:
+                            hold_days = None
                         trade_rows.append(
                             {
                                 "instrument": inst,
@@ -242,13 +261,14 @@ if __name__ == "__main__":
                                 "sell_price": sell_px,
                                 "volume": vol_amt,
                                 "cost": cost,
+                                "hold_days": hold_days,
                             }
                         )
 
             if trade_rows:
                 trade_df = pd.DataFrame(trade_rows)
 
-                # Top50 most profitable stocks by summing trade PnL
+                # All traded stocks summary (same columns as old Top50, plus hold time)
                 try:
                     grp = trade_df.groupby("instrument", dropna=True)
                     res_df = grp.agg(
@@ -257,90 +277,132 @@ if __name__ == "__main__":
                         trades=("instrument", "count"),
                         profit_amt=("profit_amt", "sum"),
                         total_cost=("cost", "sum"),
+                        total_hold_days=("hold_days", "sum"),
                     ).reset_index()
                     res_df["profit_rate"] = res_df.apply(
                         lambda r: (r["profit_amt"] / r["total_cost"]) if r["total_cost"] else float("nan"),
                         axis=1,
                     )
-                    res_df = res_df.sort_values("profit_amt", ascending=False).head(50)
-                    fig_table = go.Figure(
-                        data=[
-                            go.Table(
-                                header=dict(values=["Rank", "股票", "最初買入時間", "最後賣出時間", "中間交易次數", "最終獲利率", "最終獲利金額"], fill_color="lightgrey"),
-                                cells=dict(
-                                    values=[
-                                        (res_df.index + 1).tolist(),
-                                        res_df["instrument"].tolist(),
-                                        [str(v) for v in res_df["first_buy"]],
-                                        [str(v) for v in res_df["last_sell"]],
-                                        res_df["trades"].tolist(),
-                                        [f"{x:.2%}" if pd.notna(x) else "" for x in res_df["profit_rate"]],
-                                        [f"{x:,.0f}" for x in res_df["profit_amt"]],
-                                    ]
-                                ),
-                            )
-                        ]
-                    )
-                    fig_table.update_layout(title="Top50 最賺錢股票", height=720)
-                    pos_figs = [fig_table]
+                    res_df = res_df.sort_values("profit_amt", ascending=False).reset_index(drop=True)
 
-                    # Top50 most losing stocks by summing trade PnL
-                    res_df_loss = res_df.sort_values("profit_amt", ascending=True).head(50)
-                    fig_table_loss = go.Figure(
-                        data=[
-                            go.Table(
-                                header=dict(values=["Rank", "股票", "最初買入時間", "最後賣出時間", "中間交易次數", "最終獲利率", "最終獲利金額"], fill_color="lightgrey"),
-                                cells=dict(
-                                    values=[
-                                        (res_df_loss.index + 1).tolist(),
-                                        res_df_loss["instrument"].tolist(),
-                                        [str(v) for v in res_df_loss["first_buy"]],
-                                        [str(v) for v in res_df_loss["last_sell"]],
-                                        res_df_loss["trades"].tolist(),
-                                        [f"{x:.2%}" if pd.notna(x) else "" for x in res_df_loss["profit_rate"]],
-                                        [f"{x:,.0f}" for x in res_df_loss["profit_amt"]],
-                                    ]
-                                ),
-                            )
-                        ]
-                    )
-                    fig_table_loss.update_layout(title="Top50 最虧錢股票", height=720)
-                    pos_figs = list(pos_figs) + [fig_table_loss]
-                except Exception:
-                    pass
+                    # Build interactive HTML table; clicking trade count shows a modal with per-trade details
+                    def _fmt_num(x, fmt):
+                        try:
+                            return fmt.format(x)
+                        except Exception:
+                            return ""
 
-                # Full trade history for the single most profitable stock
-                try:
-                    if "res_df" in locals() and not res_df.empty:
-                        top_stock = res_df.iloc[0]["instrument"]
-                        top_trades = trade_df[trade_df["instrument"] == top_stock].copy()
-                        if not top_trades.empty:
-                            top_trades = top_trades.sort_values("buy_time")
-                            fig_top_stock = go.Figure(
-                                data=[
-                                    go.Table(
-                                        header=dict(
-                                            values=["Rank", "股票", "買入時間", "賣出時間", "買入價", "賣出價", "成交量", "獲利率", "獲利金額"],
-                                            fill_color="lightgrey",
-                                        ),
-                                        cells=dict(
-                                            values=[
-                                                (top_trades.index + 1).tolist(),
-                                                top_trades["instrument"].tolist(),
-                                                [str(v) for v in top_trades["buy_time"]],
-                                                [str(v) for v in top_trades["sell_time"]],
-                                                ["" if pd.isna(x) else f"{x:.3f}" for x in top_trades.get("buy_price", [])],
-                                                ["" if pd.isna(x) else f"{x:.3f}" for x in top_trades.get("sell_price", [])],
-                                                ["" if pd.isna(x) else f"{x:,.0f}" for x in top_trades.get("volume", [])],
-                                                [f"{x:.2%}" if pd.notna(x) else "" for x in top_trades["profit_rate"]],
-                                                [f"{x:,.0f}" for x in top_trades["profit_amt"]],
-                                            ]
-                                        ),
-                                    )
-                                ]
+                    trade_detail_map = {}
+                    for inst in res_df["instrument"].astype(str).tolist():
+                        sub = trade_df[trade_df["instrument"].astype(str) == inst].copy()
+                        sub = sub.sort_values("buy_time")
+                        rows = []
+                        for _, r in sub.iterrows():
+                            rows.append(
+                                {
+                                    "buy_time": str(r.get("buy_time", "")),
+                                    "sell_time": str(r.get("sell_time", "")),
+                                    "buy_price": _fmt_num(r.get("buy_price"), "{:.3f}"),
+                                    "sell_price": _fmt_num(r.get("sell_price"), "{:.3f}"),
+                                    "volume": _fmt_num(r.get("volume"), "{:,.0f}"),
+                                    "profit_rate": _fmt_num(r.get("profit_rate"), "{:.2%}"),
+                                    "profit_amt": _fmt_num(r.get("profit_amt"), "{:,.0f}"),
+                                    "hold_days": str(int(r.get("hold_days") or 0)),
+                                }
                             )
-                            fig_top_stock.update_layout(title="Top1 股票交易明細", height=720)
-                            pos_figs = list(pos_figs) + [fig_top_stock]
+                        trade_detail_map[inst] = rows
+
+                    summary_rows = []
+                    for idx, r in res_df.iterrows():
+                        inst = str(r["instrument"])
+                        summary_rows.append(
+                            "<tr>"
+                            f"<td>{idx + 1}</td>"
+                            f"<td>{inst}</td>"
+                            f"<td>{r['first_buy']}</td>"
+                            f"<td>{r['last_sell']}</td>"
+                            f"<td><a href='#' class='trade-detail' data-inst='{inst}'>{int(r['trades'])}</a></td>"
+                            f"<td>{_fmt_num(r['profit_rate'], '{:.2%}') if pd.notna(r['profit_rate']) else ''}</td>"
+                            f"<td>{_fmt_num(r['profit_amt'], '{:,.0f}')}</td>"
+                            f"<td>{int(r['total_hold_days'] or 0)}</td>"
+                            "</tr>"
+                        )
+
+                    import json as _json
+
+                    trade_detail_json = _json.dumps(trade_detail_map, ensure_ascii=False)
+
+                    summary_html = """
+                    <div id="trade-summary">
+                        <h2>交易股票清單（回測期間所有交易過）</h2>
+                        <div style="max-height:720px; overflow:auto; border:1px solid #ddd; border-radius:6px;">
+                            <table border="1" cellspacing="0" cellpadding="6" style="width:100%; border-collapse:collapse; font-family:Arial, sans-serif; font-size:12px;">
+                                <thead>
+                                    <tr style="background:#eee;">
+                                        <th>Rank</th>
+                                        <th>股票</th>
+                                        <th>最初買入時間</th>
+                                        <th>最後賣出時間</th>
+                                        <th>中間交易次數</th>
+                                        <th>最終獲利率</th>
+                                        <th>最終獲利金額</th>
+                                        <th>總持股天數</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                    """
+                    summary_html += "".join(summary_rows)
+                    summary_html += """
+                            </tbody>
+                        </table>
+                    </div>
+                    </div>
+
+                    <div id="trade-modal" style="display:none; position:fixed; z-index:9999; left:0; top:0; width:100%; height:100%; background:rgba(0,0,0,0.5);">
+                      <div style="background:#fff; margin:5% auto; padding:20px; width:90%; max-width:1200px; max-height:80%; overflow:auto; border-radius:6px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                          <h3 id="trade-modal-title">交易明細</h3>
+                          <button id="trade-modal-close" style="font-size:16px;">關閉</button>
+                        </div>
+                        <div id="trade-modal-content"></div>
+                      </div>
+                    </div>
+
+                    <script>
+                      window.tradeDetails = {trade_detail_json};
+                      function renderTradeTable(inst) {
+                        const rows = window.tradeDetails[inst] || [];
+                        let html = "<table border='1' cellspacing='0' cellpadding='6' style='width:100%; border-collapse:collapse;'>";
+                        html += "<thead><tr style='background:#eee;'><th>買入時間</th><th>賣出時間</th><th>買入價</th><th>賣出價</th><th>成交量</th><th>獲利率</th><th>獲利金額</th><th>持股天數</th></tr></thead><tbody>";
+                        for (const r of rows) {
+                          html += `<tr><td>${r.buy_time}</td><td>${r.sell_time}</td><td>${r.buy_price}</td><td>${r.sell_price}</td><td>${r.volume}</td><td>${r.profit_rate}</td><td>${r.profit_amt}</td><td>${r.hold_days}</td></tr>`;
+                        }
+                        html += "</tbody></table>";
+                        return html;
+                      }
+                      document.addEventListener('DOMContentLoaded', function () {
+                        document.querySelectorAll('.trade-detail').forEach(function (el) {
+                          el.addEventListener('click', function (e) {
+                            e.preventDefault();
+                            const inst = el.getAttribute('data-inst');
+                            document.getElementById('trade-modal-title').textContent = inst + " 交易明細";
+                            document.getElementById('trade-modal-content').innerHTML = renderTradeTable(inst);
+                            document.getElementById('trade-modal').style.display = 'block';
+                          });
+                        });
+                        document.getElementById('trade-modal-close').addEventListener('click', function () {
+                          document.getElementById('trade-modal').style.display = 'none';
+                        });
+                        document.getElementById('trade-modal').addEventListener('click', function (e) {
+                          if (e.target.id === 'trade-modal') {
+                            document.getElementById('trade-modal').style.display = 'none';
+                          }
+                        });
+                      });
+                    </script>
+                    """.replace("{trade_detail_json}", trade_detail_json)
+
+                    html_blocks.append(summary_html)
                 except Exception:
                     pass
 
@@ -393,89 +455,6 @@ if __name__ == "__main__":
                 pos_figs = list(pos_figs) + [fig_trades_best, fig_trades_worst]
     except Exception:
         pos_figs = []
-
-    # Top50 longest holding time (days) table
-    top_hold_figs = []
-    try:
-        hold_map = {}
-        # positions can be dict(datetime -> Position) or DataFrame
-        if isinstance(positions, dict):
-            for dt, pos in positions.items():
-                # normalize datetime
-                try:
-                    dt_ts = pd.to_datetime(dt)
-                except Exception:
-                    dt_ts = dt
-                # Position-like object with .position dict
-                if hasattr(pos, "position") and isinstance(pos.position, dict):
-                    for inst, info in pos.position.items():
-                        if inst in ("cash", "now_account_value", "cash_delay"):
-                            continue
-                        cnt = 0
-                        if isinstance(info, dict):
-                            # typical count key: 'count_day' (bar == "day"), or others like 'count_{bar}'
-                            cnt = info.get("count_day", None)
-                            if cnt is None:
-                                for k, v in info.items():
-                                    if isinstance(k, str) and k.startswith("count_"):
-                                        cnt = v
-                                        break
-                            if cnt is None:
-                                # fallback to stored 'amount' as proxy (rare)
-                                cnt = info.get("amount", 0) or 0
-                        else:
-                            # if info itself is numeric, treat as amount
-                            try:
-                                cnt = int(info)
-                            except Exception:
-                                cnt = 0
-                        hold_map[inst] = max(hold_map.get(inst, 0), int(cnt or 0))
-        elif isinstance(positions, pd.DataFrame):
-            df = positions.copy()
-            # if counts stored as column 'count_day' or 'count_*'
-            count_cols = [c for c in df.columns if c.startswith("count_")]
-            if len(count_cols) > 0:
-                # use max across count columns per instrument
-                if isinstance(df.index, pd.MultiIndex) and "instrument" in df.index.names:
-                    inst_idx = df.index.get_level_values("instrument")
-                    df2 = df.reset_index()
-                    df2["max_count"] = df2[count_cols].max(axis=1)
-                    gm = df2.groupby("instrument")["max_count"].max()
-                    for inst, cnt in gm.items():
-                        hold_map[inst] = int(cnt or 0)
-            elif "count_day" in df.columns:
-                gm = df["count_day"].groupby(level="instrument").max()
-                for inst, cnt in gm.items():
-                    hold_map[inst] = int(cnt or 0)
-    
-        if len(hold_map) > 0:
-            hold_df = (
-                pd.Series(hold_map, name="max_hold_days")
-                .rename_axis("instrument")
-                .reset_index()
-                .sort_values("max_hold_days", ascending=False)
-                .reset_index(drop=True)
-            )
-            top50 = hold_df.head(50)
-            # Build Plotly table
-            fig_table = go.Figure(
-                data=[
-                    go.Table(
-                        header=dict(values=["Rank", "Instrument", "Max Hold Days"], fill_color="lightgrey"),
-                        cells=dict(
-                            values=[
-                                (top50.index + 1).tolist(),
-                                top50["instrument"].tolist(),
-                                top50["max_hold_days"].tolist(),
-                            ]
-                        ),
-                    )
-                ]
-            )
-            fig_table.update_layout(title="Top50 最長持股時間 (天)", height=700)
-            top_hold_figs = [fig_table]
-    except Exception:
-        top_hold_figs = []
 
     # account (principal) curve
     account_figs = []
@@ -535,11 +514,14 @@ if __name__ == "__main__":
     perf_figs = analysis_model.model_performance_graph(pred_label, show_notebook=False) or []
 
     # Combine all generated figures into a single HTML file (account first)
-    all_figs = list(account_figs) + list(winloss_figs) + list(figs) + list(pos_figs) + list(top_hold_figs) + list(risk_figs) + list(ic_figs) + list(perf_figs)
+    all_figs = list(account_figs) + list(winloss_figs) + list(figs) + list(html_blocks) + list(pos_figs) + list(risk_figs) + list(ic_figs) + list(perf_figs)
     fragments = []
     out_dir = os.getcwd()
     for i, fig in enumerate(all_figs):
         # fragment for combined file; include plotlyjs only once
+        if isinstance(fig, str):
+            fragments.append(f"<div id=\"figure_{i}\">{fig}</div>")
+            continue
         if i == 0:
             frag = pio.to_html(fig, include_plotlyjs='cdn', full_html=False)
         else:
@@ -552,7 +534,8 @@ if __name__ == "__main__":
     combined_html += "\n<hr/>\n".join(fragments)
     combined_html += "</body></html>"
 
-    combined_path = os.path.join(out_dir, "combined_report.html")
+    rec_id_safe = rec_id or "unknown"
+    combined_path = os.path.join(out_dir, f"combined_report_{rec_id_safe}.html")
     with open(combined_path, "w", encoding="utf-8") as fp:
         fp.write(combined_html)
 

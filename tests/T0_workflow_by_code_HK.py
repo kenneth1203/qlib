@@ -274,9 +274,7 @@ if __name__ == "__main__":
                 "signal": (model, dataset),
                 "topk": 12,
                 "n_drop": 2,
-                "macd_fast": 12,
-                "macd_slow": 26,
-                "macd_signal": 9,
+                "weekly_provider_uri": "~/.qlib/qlib_data/hk_data_1w",
                 "only_tradable": True,
                 "forbid_all_trade_at_limit": True
             },

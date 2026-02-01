@@ -74,7 +74,6 @@ def filter_instruments_by_conditions(
     min_avg_amount: Optional[float] = None,
     avg_amount_window: int = 20,
     min_turnover: Optional[float] = None,
-    min_avg_turnover: Optional[float] = None,
     turnover_window: int = 20,
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
@@ -94,7 +93,7 @@ def filter_instruments_by_conditions(
     max_window = max(
         1,
         avg_amount_window if min_avg_amount is not None else 1,
-        turnover_window if min_avg_turnover is not None else 1,
+        turnover_window if min_turnover is not None else 1,
     )
     start_day = (pd.to_datetime(end_day) - pd.Timedelta(days=max_window * 3)).strftime("%Y-%m-%d")
 
@@ -130,14 +129,13 @@ def filter_instruments_by_conditions(
 
     shares = _load_issued_shares(provider_uri)
     shares = shares.reindex(vol_df.columns)
-    turnover_last = None
-    turnover_avg = None
-    if min_turnover is not None or min_avg_turnover is not None:
+    turnover_median = None
+    if min_turnover is not None:
         if shares.isna().all():
             raise RuntimeError("Turnover filter requested but issued_shares.txt is missing or empty")
-        turnover_last = vol_df.loc[last_idx] / shares
-        avg_vol = vol_df.rolling(window=turnover_window, min_periods=minp_turnover).mean().loc[last_idx]
-        turnover_avg = avg_vol / shares
+        # Use rolling median over `turnover_window` as the canonical turnover metric
+        med_vol = vol_df.rolling(window=turnover_window, min_periods=minp_turnover).median().loc[last_idx]
+        turnover_median = med_vol / shares
 
     price_last = close_df.loc[last_idx]
 
@@ -159,10 +157,8 @@ def filter_instruments_by_conditions(
         mask = _mask_ge(mask, last_amount, min_amount)
     if min_avg_amount is not None:
         mask = _mask_ge(mask, avg_amount, min_avg_amount)
-    if min_turnover is not None and turnover_last is not None:
-        mask = _mask_ge(mask, turnover_last, min_turnover, fill_missing_true=allow_missing_shares)
-    if min_avg_turnover is not None and turnover_avg is not None:
-        mask = _mask_ge(mask, turnover_avg, min_avg_turnover, fill_missing_true=allow_missing_shares)
+    if min_turnover is not None and turnover_median is not None:
+        mask = _mask_ge(mask, turnover_median, min_turnover, fill_missing_true=allow_missing_shares)
     if min_price is not None:
         mask = _mask_ge(mask, price_last, min_price)
     if max_price is not None:
@@ -181,7 +177,7 @@ def filter_instruments_by_conditions(
         "min_amount": min_amount,
         "min_avg_amount": min_avg_amount,
         "min_turnover": min_turnover,
-        "min_avg_turnover": min_avg_turnover,
+        
         "min_price": min_price,
         "max_price": max_price,
     }
@@ -190,10 +186,8 @@ def filter_instruments_by_conditions(
     metrics["amount"] = last_amount
     metrics["avg_amount"] = avg_amount
     metrics["price"] = price_last
-    if turnover_last is not None:
-        metrics["turnover"] = turnover_last
-    if turnover_avg is not None:
-        metrics["avg_turnover"] = turnover_avg
+    if turnover_median is not None:
+        metrics["turnover"] = turnover_median
     info["metrics"] = metrics
     return keep_insts, info
 
@@ -205,11 +199,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--min-amount", type=float, default=None, help="minimum dollar amount on target day")
     parser.add_argument("--min-avg-amount", type=float, default=None, help="minimum rolling average dollar amount")
     parser.add_argument("--avg-amount-window", type=int, default=20, help="rolling window for average dollar amount")
-    parser.add_argument("--min-turnover", type=float, default=None, help="minimum turnover on target day (volume / shares)")
-    parser.add_argument(
-        "--min-avg-turnover", type=float, default=None, help="minimum rolling average turnover (volume / shares)"
-    )
-    parser.add_argument("--turnover-window", type=int, default=20, help="rolling window for average turnover")
+    parser.add_argument("--min-turnover", type=float, default=None, help="minimum rolling median turnover (volume / shares)")
+    parser.add_argument("--turnover-window", type=int, default=20, help="rolling window for median turnover")
     parser.add_argument("--min-price", type=float, default=None, help="minimum last close price")
     parser.add_argument("--max-price", type=float, default=None, help="maximum last close price")
     parser.add_argument("--output", default=None, help="optional CSV path to save filtered instruments with metrics")
@@ -227,7 +218,6 @@ def main():
         min_avg_amount=args.min_avg_amount,
         avg_amount_window=args.avg_amount_window,
         min_turnover=args.min_turnover,
-        min_avg_turnover=args.min_avg_turnover,
         turnover_window=args.turnover_window,
         min_price=args.min_price,
         max_price=args.max_price,
@@ -240,8 +230,8 @@ def main():
         f"({info['pct']:.2f}% kept)"
     )
     print("Sample:", info.get("sample", []))
-    print("Result list first 50 instruments:")
-    print("\n".join(keep_insts[:50]))
+    print("Result list first 10 instruments:")
+    print("\n".join(keep_insts[:10]))
 
     out_path = args.output
     if out_path and "metrics" in info:
