@@ -37,8 +37,8 @@ CALENDAR_BENCH_URL_MAP = {
     "US_ALL": "^GSPC",
     "IN_ALL": "^NSEI",
     "BR_ALL": "^BVSP",
-    "HK_ALL": "0001.HK",
-    #"HK_ALL": "^HSI",
+    #"HK_ALL": "0001.HK",
+    "HK_ALL": "^HSI",
 }
 
 _BENCH_CALENDAR_LIST = None

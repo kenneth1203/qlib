@@ -1013,7 +1013,46 @@ class YahooNormalizeUS1min(YahooNormalizeUS, YahooNormalize1min):
 
 class YahooNormalizeHK:
     def _get_calendar_list(self) -> Iterable[pd.Timestamp]:
-        return get_calendar_list("HK_ALL")
+        cal = get_calendar_list("HK_ALL")
+        futu_dates = []
+        try:
+            from futu import OpenQuoteContext, RET_OK, TradeDateMarket
+
+            end_ts = pd.Timestamp.today().normalize()
+            start_ts = end_ts - pd.DateOffset(years=10)
+            ctx = OpenQuoteContext(host="127.0.0.1", port=11111)
+            try:
+                ret, data = ctx.request_trading_days(
+                    market=TradeDateMarket.HK,
+                    start=start_ts.strftime("%Y-%m-%d"),
+                    end=end_ts.strftime("%Y-%m-%d"),
+                )
+            finally:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+
+            if ret == RET_OK and data is not None:
+                if isinstance(data, list):
+                    futu_dates = [d.get("time") for d in data if isinstance(d, dict) and d.get("time")]
+                else:
+                    try:
+                        df = pd.DataFrame(data)
+                        if "time" in df.columns:
+                            futu_dates = df["time"].tolist()
+                    except Exception:
+                        futu_dates = []
+        except Exception as e:
+            logger.warning(f"Futu trading days fetch failed: {e}")
+
+        try:
+            cal_ts = pd.to_datetime(list(cal), errors="coerce")
+        except Exception:
+            cal_ts = pd.to_datetime([], errors="coerce")
+        futu_ts = pd.to_datetime(futu_dates, errors="coerce")
+        merged = pd.DatetimeIndex(list(cal_ts) + list(futu_ts)).dropna().unique().sort_values()
+        return list(merged)
 
 class YahooNormalizeHK1d(YahooNormalizeHK, YahooNormalize1d):
     pass
@@ -1514,7 +1553,7 @@ class Run(BaseRun):
 
                 qlib_root = Path("C:/Users/kennethlao/.qlib/qlib_data")
                 logger.info(
-                    f"week_data=True: dumping bins to {qlib_root.joinpath('hk_data_1w')}, {qlib_root.joinpath('hk_data_1m')}, {qlib_root.joinpath('hk_data_1y')}"
+                    f"week_data=True: dumping bins to {qlib_root.joinpath('hk_data_1w')}, {qlib_root.joinpath('hk_data_1mo')}, {qlib_root.joinpath('hk_data_1y')}"
                 )
                 if indicator:
                     self._dump_dir(w_ind_dir, qlib_root.joinpath("hk_data_1w"))

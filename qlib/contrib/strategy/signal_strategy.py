@@ -322,9 +322,14 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         kdj_oversold: float = 20.0,
         stop_loss_pct: float = 0.20,
         #stop_loss_pct: Optional[float] = None,
+        initial_risk_degree: float = 0.5,
+        ramp_steps: int = 5,
+        take_profit_pct: float = 1.0,
+        take_profit_sell_ratio: float = 0.5,
+        trailing_stop_drawdown: float = 0.30,
         min_turnover: float = 0.001,
         #min_turnover: Optional[float] = None,
-        allow_missing_shares: bool = True,
+        allow_missing_shares: bool = False,
         weekly_provider_uri: Optional[str] = None,
         **kwargs,
     ):
@@ -337,6 +342,11 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         self.kdj_overbought = kdj_overbought
         self.kdj_oversold = kdj_oversold
         self.stop_loss_pct = stop_loss_pct
+        self.initial_risk_degree = initial_risk_degree
+        self.ramp_steps = ramp_steps
+        self.take_profit_pct = take_profit_pct
+        self.take_profit_sell_ratio = take_profit_sell_ratio
+        self.trailing_stop_drawdown = trailing_stop_drawdown
         self.min_turnover = min_turnover
         self.allow_missing_shares = allow_missing_shares
         self.weekly_provider_uri = weekly_provider_uri
@@ -356,6 +366,9 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         self._weekly_cache_start: Optional[pd.Timestamp] = None
         self._weekly_cache_end: Optional[pd.Timestamp] = None
         self._weekly_cache_ready: bool = False
+        # take-profit/trailing-stop tracking
+        self._tp_holdout: Set[str] = set()
+        self._tp_high: Dict[str, float] = {}
 
     def _load_issued_shares(self) -> pd.Series:
         if self._issued_shares_loaded:
@@ -365,6 +378,16 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
             from qlib.config import C
 
             provider_uri = getattr(C, "provider_uri", None)
+            # qlib may set provider_uri as a mapping (e.g. {'__DEFAULT_FREQ': Path(...)})
+            try:
+                if isinstance(provider_uri, dict):
+                    provider_uri = provider_uri.get("__DEFAULT_FREQ") or next(iter(provider_uri.values()), None)
+                if provider_uri is not None and not isinstance(provider_uri, str):
+                    provider_uri = str(provider_uri)
+            except Exception:
+                pass
+            logger = get_module_logger("MACDTopkDropoutStrategy")
+            logger.debug("resolved provider_uri for issued_shares: %s", provider_uri)
         except Exception:
             provider_uri = None
         if not provider_uri:
@@ -421,6 +444,7 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                 mask = mask.fillna(False)
             return mask
         except Exception:
+            print("Unexpected error in _get_turnover_mask for %s", trade_date)
             return pd.Series(self.allow_missing_shares, index=pd.Index(instruments, name="instrument"))
 
     def _ensure_turnover_cache(self, instruments: List[str]) -> Optional[pd.Series]:
@@ -437,43 +461,72 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                 end_ts = None
             self._turnover_cache_start = pd.Timestamp(start_ts) if start_ts is not None else None
             self._turnover_cache_end = pd.Timestamp(end_ts) if end_ts is not None else None
-            feat = D.features(
-                insts,
-                ["$volume"],
-                start_time=self._turnover_cache_start,
-                end_time=self._turnover_cache_end,
-                freq="day",
-                disk_cache=True,
-            )
-            if feat is None or feat.empty:
-                return None
-            vol = pd.to_numeric(feat["$volume"], errors="coerce")
-            vol = vol.sort_index()
+            df_src = None
+            if self._macd_feat_cache is not None and "$volume" in self._macd_feat_cache.columns:
+                missing_macd = [i for i in insts if i not in self._macd_cache_insts]
+                if missing_macd:
+                    self._ensure_macd_cache(missing_macd)
+                if self._macd_feat_cache is not None and "$volume" in self._macd_feat_cache.columns:
+                    df_src = self._macd_feat_cache
+            if df_src is None:
+                feat = D.features(
+                    insts,
+                    ["$volume"],
+                    start_time=self._turnover_cache_start,
+                    end_time=self._turnover_cache_end,
+                    freq="day",
+                    disk_cache=True,
+                )
+                if feat is None or feat.empty:
+                    return None
+                vol = pd.to_numeric(feat["$volume"], errors="coerce")
+                vol = vol.sort_index()
+            else:
+                vol = pd.to_numeric(df_src["$volume"], errors="coerce")
+                vol = vol.sort_index()
             shares = self._load_issued_shares()
             shares_all = shares.reindex(vol.index.get_level_values("instrument")).values
             turnover = vol / shares_all
             self._turnover_cache_all = turnover
-            self._turnover_cache_insts = set(insts)
+            self._turnover_cache_insts = set(vol.index.get_level_values("instrument"))
             return self._turnover_cache_all
 
         missing = [i for i in insts if i not in self._turnover_cache_insts]
         if missing:
-            feat = D.features(
-                missing,
-                ["$volume"],
-                start_time=self._turnover_cache_start,
-                end_time=self._turnover_cache_end,
-                freq="day",
-                disk_cache=True,
-            )
-            if feat is not None and not feat.empty:
-                vol = pd.to_numeric(feat["$volume"], errors="coerce")
+            df_src = None
+            if self._macd_feat_cache is not None and "$volume" in self._macd_feat_cache.columns:
+                missing_macd = [i for i in missing if i not in self._macd_cache_insts]
+                if missing_macd:
+                    self._ensure_macd_cache(missing_macd)
+                if self._macd_feat_cache is not None and "$volume" in self._macd_feat_cache.columns:
+                    df_src = self._macd_feat_cache
+            if df_src is None:
+                feat = D.features(
+                    missing,
+                    ["$volume"],
+                    start_time=self._turnover_cache_start,
+                    end_time=self._turnover_cache_end,
+                    freq="day",
+                    disk_cache=True,
+                )
+                if feat is not None and not feat.empty:
+                    vol = pd.to_numeric(feat["$volume"], errors="coerce")
+                    vol = vol.sort_index()
+                    shares = self._load_issued_shares()
+                    shares_all = shares.reindex(vol.index.get_level_values("instrument")).values
+                    turnover = vol / shares_all
+                    self._turnover_cache_all = pd.concat([self._turnover_cache_all, turnover], axis=0)
+                    self._turnover_cache_insts.update(missing)
+            else:
+                vol = pd.to_numeric(df_src["$volume"], errors="coerce")
                 vol = vol.sort_index()
-                shares = self._load_issued_shares()
-                shares_all = shares.reindex(vol.index.get_level_values("instrument")).values
-                turnover = vol / shares_all
-                self._turnover_cache_all = pd.concat([self._turnover_cache_all, turnover], axis=0)
-                self._turnover_cache_insts.update(missing)
+                vol_missing = vol[vol.index.get_level_values("instrument").isin(missing)]
+                if not vol_missing.empty:
+                    shares = self._load_issued_shares()
+                    shares_all = shares.reindex(vol_missing.index.get_level_values("instrument")).values
+                    turnover = vol_missing / shares_all
+                    self._turnover_cache_all = pd.concat([self._turnover_cache_all, turnover], axis=0)
+                    self._turnover_cache_insts.update(missing)
         return self._turnover_cache_all
 
     def _ensure_macd_cache(self, instruments: List[str]) -> Optional[pd.DataFrame]:
@@ -486,6 +539,10 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
             "$KDJ_D",
             "$MFI",
         ]
+        # include volume so turnover cache can reuse this fetch
+        fields = ["$volume"] + fields
+        # include shorter/longer EMAs so we can detect EMA bearish trend (10<60<120)
+        fields = ["$EMA10", "$EMA60", "$EMA120"] + fields
         insts = list(dict.fromkeys(instruments))
         if not insts:
             return None
@@ -685,6 +742,22 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                             kdj_d_prev = (
                                 float(prev_row.get("$KDJ_D")) if prev_row is not None and "$KDJ_D" in prev_row else None
                             )
+                            ema10 = float(row.get("$EMA10")) if "$EMA10" in row else None
+                            ema60 = float(row.get("$EMA60")) if "$EMA60" in row else None
+                            ema120 = float(row.get("$EMA120")) if "$EMA120" in row else None
+                            # require recent non-zero volume: last ~2 weeks (10 trading days)
+                            vol_ok = False
+                            try:
+                                if "$volume" in sub_inst.columns:
+                                    vol_series = pd.to_numeric(sub_inst["$volume"], errors="coerce")
+                                    vol_recent = vol_series[vol_series.index <= end_ts].tail(10)
+                                    vol_ok = (
+                                        len(vol_recent) >= 10
+                                        and vol_recent.notna().all()
+                                        and (vol_recent > 0).all()
+                                    )
+                            except Exception:
+                                vol_ok = False
                         except Exception:
                             dif = dea = dif_prev = dea_prev = rsi = kdj_k = kdj_d = mfi = kdj_k_prev = kdj_d_prev = None
                             macd = macd_prev = macd_prev2 = macd_prev3 = None
@@ -698,11 +771,20 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                             and macd_prev2 is not None
                             and macd < macd_prev < macd_prev2
                         )
+                        ema_bear = (
+                            ema10 is not None
+                            and ema60 is not None
+                            and ema120 is not None
+                            and ema10 < ema60 < ema120
+                        )
+
                         macd_buy = (
                             dif > dea
                             and dif > 0
                             and kdj_k > kdj_d
                             and not macd_down_2
+                            and vol_ok
+                            #and not ema_bear
                         )
                         kdj_buy = (
                             kdj_k is not None
@@ -758,10 +840,68 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
             return TradeDecisionWO([], self)
 
         # MACD flags on union of holdings and candidate universe
-        current_stock_list = list(self.trade_position.get_stock_list())
+        current_stock_list_all = list(self.trade_position.get_stock_list())
+
+        # take-profit and trailing-stop processing
+        forced_sell_amounts: Dict[str, float] = {}
+        tp_holdout_add: Set[str] = set()
+        tp_holdout_remove: Set[str] = set()
+        for code in current_stock_list_all:
+            try:
+                buy_price = self.trade_position.position.get(code, {}).get("buy_price", None)
+            except Exception:
+                buy_price = None
+            try:
+                cur_price = self.trade_exchange.get_deal_price(
+                    stock_id=code,
+                    start_time=trade_start_time,
+                    end_time=trade_end_time,
+                    direction=OrderDir.SELL,
+                )
+            except Exception:
+                cur_price = None
+
+            if code in self._tp_holdout:
+                # update high watermark and check trailing stop
+                if cur_price is not None:
+                    prev_high = self._tp_high.get(code, cur_price)
+                    self._tp_high[code] = max(prev_high, cur_price)
+                    if self._tp_high[code] > 0 and cur_price <= self._tp_high[code] * (1 - self.trailing_stop_drawdown):
+                        # sell all remaining on trailing stop
+                        try:
+                            amt = self.trade_position.get_stock_amount(code=code)
+                        except Exception:
+                            amt = 0
+                        if amt and amt > 0:
+                            forced_sell_amounts[code] = amt
+                            tp_holdout_remove.add(code)
+                continue
+
+            # initial take-profit: +100% gain -> sell 50% and move to holdout list
+            if buy_price is not None and cur_price is not None and buy_price > 0:
+                if cur_price >= buy_price * (1 + self.take_profit_pct):
+                    try:
+                        amt = self.trade_position.get_stock_amount(code=code)
+                    except Exception:
+                        amt = 0
+                    if amt and amt > 0:
+                        sell_amt = amt * self.take_profit_sell_ratio
+                        factor = self.trade_exchange.get_factor(
+                            stock_id=code, start_time=trade_start_time, end_time=trade_end_time
+                        )
+                        sell_amt = self.trade_exchange.round_amount_by_trade_unit(sell_amt, factor)
+                        if sell_amt and sell_amt > 0:
+                            forced_sell_amounts[code] = sell_amt
+                            tp_holdout_add.add(code)
+                            if cur_price is not None:
+                                self._tp_high[code] = cur_price
+
+        # exclude holdout names from TopK rotation
+        holdout_set = set(self._tp_holdout) | tp_holdout_add
+        current_stock_list = [c for c in current_stock_list_all if c not in holdout_set]
         candidates: Set[str] = set(current_stock_list) | set(pred_score.index.tolist())
         macd_flags = self._compute_macd_flags(list(candidates), trade_start_time)
-        bullish = {k for k, v in macd_flags.items() if v.get("buy")}
+        bullish = {k for k, v in macd_flags.items() if v.get("buy") and k not in holdout_set}
         bearish = {k for k, v in macd_flags.items() if v.get("sell")}
 
         # apply turnover filter to buy candidates
@@ -772,7 +912,7 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         # stop-loss: force sell if price drops below buy price by stop_loss_pct
         stop_loss_set: Set[str] = set()
         if self.stop_loss_pct is not None:
-            for code in current_stock_list:
+            for code in current_stock_list_all:
                 try:
                     buy_price = self.trade_position.position.get(code, {}).get("buy_price", None)
                 except Exception:
@@ -793,8 +933,8 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                 if cur_price <= buy_price * (1 - self.stop_loss_pct):
                     stop_loss_set.add(code)
 
-        # If no bullish signals and no stop-loss, keep positions unchanged
-        if not bullish and not stop_loss_set:
+        # If no bullish signals and no stop-loss and no take-profit actions, keep positions unchanged
+        if not bullish and not stop_loss_set and not forced_sell_amounts:
             return TradeDecisionWO([], self)
 
         # rank existing holdings by score (descending)
@@ -802,6 +942,10 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         bearish_holdings = last_scored[last_scored.index.isin(bearish)]
         # always sell holdings that meet sell condition or stop-loss
         sell_list = list(stop_loss_set)
+        # include forced take-profit sells (partial or full)
+        for code in forced_sell_amounts.keys():
+            if code not in sell_list:
+                sell_list.append(code)
         sell_set = set(sell_list)
         for code in bearish_holdings.sort_values(ascending=True).index:
             if code not in sell_set:
@@ -819,13 +963,14 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         bullish_ranked = bullish_new.sort_values(ascending=False)
 
         # capacity: free slots after planned sells, plus any gap to topk
-        post_sell_holdings = len(current_stock_list) - len(sell_list)
+        sold_effective = len([c for c in sell_list if c in current_stock_list])
+        post_sell_holdings = len(current_stock_list) - sold_effective
         open_slots = max(self.topk - post_sell_holdings, 0)
         max_buys = min(len(sell_list) + open_slots, len(bullish_ranked))
         buy_list = list(bullish_ranked.index[:max_buys]) if max_buys > 0 else []
 
-        # if still nothing to buy, keep unchanged (and avoid selling), unless stop-loss triggered
-        if not buy_list and not stop_loss_set:
+        # if still nothing to buy, keep unchanged (and avoid selling), unless stop-loss or take-profit triggered
+        if not buy_list and not stop_loss_set and not forced_sell_amounts:
             return TradeDecisionWO([], self)
 
         # reuse tradability helpers from parent
@@ -851,10 +996,13 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         for code in sell_list:
             if not is_tradable(code, None if self.forbid_all_trade_at_limit else OrderDir.SELL):
                 continue
-            if code not in stop_loss_set:
+            if code not in stop_loss_set and code not in forced_sell_amounts:
                 if current_temp.get_stock_count(code, bar=time_per_step) < self.hold_thresh:
                     continue
-            sell_amount = current_temp.get_stock_amount(code=code)
+            if code in forced_sell_amounts:
+                sell_amount = forced_sell_amounts[code]
+            else:
+                sell_amount = current_temp.get_stock_amount(code=code)
             sell_order = Order(
                 stock_id=code,
                 amount=sell_amount,
@@ -867,8 +1015,13 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                 trade_val, trade_cost, trade_price = self.trade_exchange.deal_order(sell_order, position=current_temp)
                 cash += trade_val - trade_cost
 
-        # allocate cash equally to buys
-        value = cash * self.risk_degree / len(buy_list) if len(buy_list) > 0 else 0
+        # allocate cash equally to buys with staged ramp-up from initial_risk_degree
+        if self.ramp_steps is not None and self.ramp_steps > 0:
+            ramp = min(1.0, self.initial_risk_degree + (1 - self.initial_risk_degree) * (trade_step / self.ramp_steps))
+        else:
+            ramp = 1.0
+        risk_scale = self.initial_risk_degree if trade_step == 0 else ramp
+        value = cash * self.risk_degree * risk_scale / len(buy_list) if len(buy_list) > 0 else 0
         for code in buy_list:
             if not is_tradable(code, None if self.forbid_all_trade_at_limit else OrderDir.BUY):
                 continue
@@ -890,6 +1043,14 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                 direction=Order.BUY,
             )
             buy_order_list.append(buy_order)
+
+        # update holdout tracking
+        if tp_holdout_add:
+            self._tp_holdout.update(tp_holdout_add)
+        if tp_holdout_remove:
+            for c in tp_holdout_remove:
+                self._tp_holdout.discard(c)
+                self._tp_high.pop(c, None)
 
         return TradeDecisionWO(sell_order_list + buy_order_list, self)
 

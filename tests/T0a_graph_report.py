@@ -191,18 +191,84 @@ if __name__ == "__main__":
                     close_wide = None
 
             trade_rows = []
-            if value_df is not None and not value_df.empty:
+            if amount_series is not None and close_wide is not None:
+                amt_wide = amount_series.unstack(level="instrument").reindex(close_wide.index).fillna(0)
+                for inst in amt_wide.columns:
+                    amt_s = amt_wide[inst].fillna(0)
+                    if (amt_s.abs() > 0).sum() == 0:
+                        continue
+                    price_s = None
+                    if close_wide is not None and inst in close_wide.columns:
+                        price_s = close_wide[inst].reindex(amt_s.index)
+                    lot_queue = []  # FIFO lots: (buy_time, buy_price, amount)
+                    prev_amt = 0.0
+                    for dt, amt in amt_s.items():
+                        try:
+                            amt = float(amt)
+                        except Exception:
+                            continue
+                        diff = amt - prev_amt
+                        if diff > 0:
+                            buy_px = None
+                            try:
+                                if price_s is not None and dt in price_s.index:
+                                    buy_px = float(price_s.loc[dt])
+                            except Exception:
+                                buy_px = None
+                            lot_queue.append([dt, buy_px, diff])
+                        elif diff < 0:
+                            sell_amt = -diff
+                            sell_px = None
+                            try:
+                                if price_s is not None and dt in price_s.index:
+                                    sell_px = float(price_s.loc[dt])
+                            except Exception:
+                                sell_px = None
+                            remain_amt = amt
+                            while sell_amt > 0 and lot_queue:
+                                lot_dt, lot_px, lot_amt = lot_queue[0]
+                                take_amt = min(lot_amt, sell_amt)
+                                pnl = float("nan")
+                                cost = None
+                                rate = float("nan")
+                                if lot_px is not None and sell_px is not None:
+                                    pnl = (sell_px - lot_px) * take_amt
+                                    cost = lot_px * take_amt
+                                    rate = (pnl / cost) if cost else float("nan")
+                                hold_days = None
+                                try:
+                                    hold_days = (pd.to_datetime(dt) - pd.to_datetime(lot_dt)).days
+                                except Exception:
+                                    hold_days = None
+                                trade_rows.append(
+                                    {
+                                        "instrument": inst,
+                                        "buy_time": lot_dt,
+                                        "sell_time": dt,
+                                        "profit_rate": rate,
+                                        "profit_amt": pnl,
+                                        "buy_price": lot_px,
+                                        "sell_price": sell_px,
+                                        "volume": take_amt,
+                                        "remain_volume": remain_amt,
+                                        "cost": cost,
+                                        "hold_days": hold_days,
+                                    }
+                                )
+                                lot_amt -= take_amt
+                                sell_amt -= take_amt
+                                if lot_amt <= 0:
+                                    lot_queue.pop(0)
+                                else:
+                                    lot_queue[0][2] = lot_amt
+                        prev_amt = amt
+            elif value_df is not None and not value_df.empty:
                 for inst in value_df.columns:
                     series = value_df[inst].fillna(0)
                     # use absolute position value to handle shorts
                     hold_mask = series.abs() > 0
                     if not hold_mask.any():
                         continue
-                    first_idx = hold_mask.idxmax()
-                    last_idx = hold_mask[::-1].idxmax()
-                    enters = (hold_mask.astype(int).diff().fillna(hold_mask.astype(int)) == 1).sum()
-                    start_val = float(series.loc[first_idx]) if first_idx in series.index else float("nan")
-                    end_val = float(series.loc[last_idx]) if last_idx in series.index else float("nan")
                     # reconstruct simple round-trip trades by holding intervals
                     diff = hold_mask.astype(int).diff().fillna(hold_mask.astype(int))
                     starts = diff[diff == 1].index.tolist()
@@ -236,6 +302,12 @@ if __name__ == "__main__":
                                 vol_amt = float(amount_series.unstack(level="instrument").reindex(series.index).loc[s_dt, inst])
                         except Exception:
                             vol_amt = None
+                        remain_amt = None
+                        try:
+                            if amount_series is not None:
+                                remain_amt = float(amount_series.unstack(level="instrument").reindex(series.index).loc[e_dt, inst])
+                        except Exception:
+                            remain_amt = None
                         # Prefer price * volume for PnL when available
                         if vol_amt is not None and buy_px is not None and sell_px is not None:
                             pnl = (sell_px - buy_px) * vol_amt
@@ -260,6 +332,7 @@ if __name__ == "__main__":
                                 "buy_price": buy_px,
                                 "sell_price": sell_px,
                                 "volume": vol_amt,
+                                "remain_volume": remain_amt,
                                 "cost": cost,
                                 "hold_days": hold_days,
                             }
@@ -305,6 +378,7 @@ if __name__ == "__main__":
                                     "buy_price": _fmt_num(r.get("buy_price"), "{:.3f}"),
                                     "sell_price": _fmt_num(r.get("sell_price"), "{:.3f}"),
                                     "volume": _fmt_num(r.get("volume"), "{:,.0f}"),
+                                    "remain_volume": _fmt_num(r.get("remain_volume"), "{:,.0f}"),
                                     "profit_rate": _fmt_num(r.get("profit_rate"), "{:.2%}"),
                                     "profit_amt": _fmt_num(r.get("profit_amt"), "{:,.0f}"),
                                     "hold_days": str(int(r.get("hold_days") or 0)),
@@ -372,10 +446,10 @@ if __name__ == "__main__":
                       window.tradeDetails = {trade_detail_json};
                       function renderTradeTable(inst) {
                         const rows = window.tradeDetails[inst] || [];
-                        let html = "<table border='1' cellspacing='0' cellpadding='6' style='width:100%; border-collapse:collapse;'>";
-                        html += "<thead><tr style='background:#eee;'><th>買入時間</th><th>賣出時間</th><th>買入價</th><th>賣出價</th><th>成交量</th><th>獲利率</th><th>獲利金額</th><th>持股天數</th></tr></thead><tbody>";
+                                                let html = "<table border='1' cellspacing='0' cellpadding='6' style='width:100%; border-collapse:collapse;'>";
+                                                html += "<thead><tr style='background:#eee;'><th>買入時間</th><th>賣出時間</th><th>買入價</th><th>賣出價</th><th>成交量</th><th>剩餘持倉</th><th>獲利率</th><th>獲利金額</th><th>持股天數</th></tr></thead><tbody>";
                         for (const r of rows) {
-                          html += `<tr><td>${r.buy_time}</td><td>${r.sell_time}</td><td>${r.buy_price}</td><td>${r.sell_price}</td><td>${r.volume}</td><td>${r.profit_rate}</td><td>${r.profit_amt}</td><td>${r.hold_days}</td></tr>`;
+                                                    html += `<tr><td>${r.buy_time}</td><td>${r.sell_time}</td><td>${r.buy_price}</td><td>${r.sell_price}</td><td>${r.volume}</td><td>${r.remain_volume}</td><td>${r.profit_rate}</td><td>${r.profit_amt}</td><td>${r.hold_days}</td></tr>`;
                         }
                         html += "</tbody></table>";
                         return html;

@@ -313,15 +313,6 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
             # apply multi-condition trend filter
             bullish_set = set()
             golden_set = set()
-            def _weekly_dif_dea(close_s: pd.Series):
-                close_s = close_s.dropna().astype(float)
-                if close_s.empty:
-                    return None, None
-                ema_fast = close_s.ewm(span=12, adjust=False).mean()
-                ema_slow = close_s.ewm(span=26, adjust=False).mean()
-                dif = ema_fast - ema_slow
-                dea = dif.ewm(span=9, adjust=False).mean()
-                return float(dif.iloc[-1]), float(dea.iloc[-1])
 
             try:
                 if cand_insts:
@@ -335,31 +326,54 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                     )
                     weekly_map = {}
                     try:
-                        qlib.init(provider_uri=week_provider_uri, region=REG_HK)
-                        weekly_feat = D.features(
-                            cand_insts,
-                            ["$close"],
-                            start_time=start_dt,
-                            end_time=target_day,
-                        )
-                        if (
-                            isinstance(weekly_feat, pd.DataFrame)
-                            and not weekly_feat.empty
-                            and isinstance(weekly_feat.index, pd.MultiIndex)
+                        # Read precomputed weekly indicators from qlib features (freq='week')
+                        weekly_fields = ["$DIF", "$DEA", "$EMA10", "$EMA60", "$EMA120"]
+                        # Switch qlib provider to weekly provider URI if configured
+                        try:
+                            from qlib.config import C
+                            orig_provider = getattr(C, "provider_uri", None)
+                            orig_region = getattr(C, "region", None)
+                        except Exception:
+                            orig_provider = None
+                            orig_region = None
+                        switched = False
+                        try:
+                            if orig_provider != week_provider_uri:
+                                qlib.init(provider_uri=week_provider_uri, region=REG_HK)
+                                switched = True
+                            weekly_feat = D.features(
+                                cand_insts,
+                                weekly_fields,
+                                start_time=start_dt,
+                                end_time=target_day,
+                            )
+                        finally:
+                            if switched:
+                                try:
+                                    qlib.init(provider_uri=orig_provider, region=orig_region)
+                                except Exception:
+                                    pass
+                        if isinstance(weekly_feat, pd.DataFrame) and not weekly_feat.empty and isinstance(
+                            weekly_feat.index, pd.MultiIndex
                         ):
                             for inst, w_sub in weekly_feat.groupby(level=0):
                                 w_inst = w_sub.droplevel(0).sort_index()
                                 if w_inst.empty:
                                     continue
-                                w_row = w_inst.iloc[-1]
-                                if "$close" not in w_inst.columns:
+                                # pick last weekly row on or before target_day
+                                try:
+                                    row = w_inst[w_inst.index <= pd.Timestamp(target_day)].iloc[-1]
+                                except Exception:
                                     continue
-                                w_dif, w_dea = _weekly_dif_dea(w_inst["$close"])
-                                weekly_map[inst] = (w_dif, w_dea)
+                                weekly_map[inst] = {
+                                    "dif": float(row.get("$DIF")) if "$DIF" in row and pd.notna(row.get("$DIF")) else None,
+                                    "dea": float(row.get("$DEA")) if "$DEA" in row and pd.notna(row.get("$DEA")) else None,
+                                    "ema10": float(row.get("$EMA10")) if "$EMA10" in row and pd.notna(row.get("$EMA10")) else None,
+                                    "ema60": float(row.get("$EMA60")) if "$EMA60" in row and pd.notna(row.get("$EMA60")) else None,
+                                    "ema120": float(row.get("$EMA120")) if "$EMA120" in row and pd.notna(row.get("$EMA120")) else None,
+                                }
                     except Exception:
                         weekly_map = {}
-                    finally:
-                        qlib.init(provider_uri=provider_uri, region=REG_HK)
                     if isinstance(feat, pd.DataFrame) and not feat.empty and isinstance(feat.index, pd.MultiIndex):
                         for inst, sub in feat.groupby(level=0):
                             sub_inst = sub.droplevel(0).sort_index()
@@ -394,11 +408,23 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                             # weekly trend: DIF>0 and DEA>0
                             weekly_dif = None
                             weekly_dea = None
+                            weekly_ema10 = weekly_ema60 = weekly_ema120 = None
                             if inst in weekly_map:
-                                weekly_dif, weekly_dea = weekly_map.get(inst, (None, None))
+                                w = weekly_map.get(inst, {})
+                                weekly_dif = w.get("dif")
+                                weekly_dea = w.get("dea")
+                                weekly_ema10 = w.get("ema10")
+                                weekly_ema60 = w.get("ema60")
+                                weekly_ema120 = w.get("ema120")
 
                             cond1 = weekly_dif is not None and weekly_dea is not None and weekly_dif > 0
-                            cond2 = close is not None and ema120 is not None and close > ema120
+                            # cond2: require weekly EMA bullish alignment (shorter > mid > longer)
+                            cond2 = (
+                                weekly_ema10 is not None
+                                and weekly_ema60 is not None
+                                and weekly_ema120 is not None
+                                and weekly_ema10 > weekly_ema60 > weekly_ema120
+                            )
                             cond3 = dif is not None and dea is not None and dif > dea
                             cond4 = (
                                 kdj_k is not None

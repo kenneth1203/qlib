@@ -7,6 +7,7 @@ Qlib provides two kinds of interfaces.
 
 The interface of (1) is `qrun XXX.yaml`.  The interface of (2) is script like this, which nearly does the same thing as `qrun XXX.yaml`
 """
+
 import qlib
 from qlib.constant import REG_HK
 from qlib.utils import init_instance_by_config, flatten_dict
@@ -149,7 +150,6 @@ if __name__ == "__main__":
     provider_uri = "~/.qlib/qlib_data/hk_data"  # HK 資料目錄
     GetData().qlib_data(target_dir=provider_uri, region=REG_HK, exists_skip=True)
     qlib.init(provider_uri=provider_uri, region=REG_HK)
-
     # Determine last trading day from qlib calendar and update task/backtest dates
     try:
         # Try explicit call; some qlib versions accept None arguments

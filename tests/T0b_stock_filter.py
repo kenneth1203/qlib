@@ -77,6 +77,9 @@ def filter_instruments_by_conditions(
     turnover_window: int = 20,
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
+    exclude_ema_downtrend: bool = False,
+    month_provider_uri: Optional[str] = None,
+    year_provider_uri: Optional[str] = None,
     auto_init: bool = True,
     allow_missing_shares: bool = False,
 ) -> Tuple[List[str], dict]:
@@ -139,7 +142,82 @@ def filter_instruments_by_conditions(
 
     price_last = close_df.loc[last_idx]
 
+    # EMA60 and EMA120: only computed from monthly bars if requested.
+    # Do NOT compute daily EMAs here — monthly EMAs will be used when
+    # `exclude_ema_downtrend` is requested and `month_provider_uri` is provided.
+    ema60_last = pd.Series(np.nan, index=close_df.columns)
+    ema120_last = pd.Series(np.nan, index=close_df.columns)
+
+    if exclude_ema_downtrend:
+        # Try yearly EMA provider first, fall back to monthly provider if yearly unavailable.
+        try:
+            try:
+                from qlib.config import C
+                orig_provider = getattr(C, "provider_uri", None)
+                orig_region = getattr(C, "region", None)
+            except Exception:
+                orig_provider = None
+                orig_region = None
+            switched = False
+            # build provider list: year first, then month fallback
+            provider_attempts = []
+            if year_provider_uri:
+                provider_attempts.append((year_provider_uri, "year"))
+            if month_provider_uri:
+                provider_attempts.append((month_provider_uri, "month"))
+
+            m_ema60 = {}
+            m_ema120 = {}
+            for prov_uri, freq in provider_attempts:
+                try:
+                    if orig_provider != prov_uri:
+                        qlib.init(provider_uri=os.path.expanduser(prov_uri), region=REG_HK)
+                        switched = True
+                    # fetch precomputed EMA features from the provider (provider determines frequency)
+                    ema_feats = ["$EMA60", "$EMA120"]
+                    monthly = D.features(insts, ema_feats, start_time=start_day, end_time=end_day)
+                    if not (isinstance(monthly, pd.DataFrame) and not monthly.empty and isinstance(monthly.index, pd.MultiIndex)):
+                        # try next provider
+                        continue
+                    for inst, sub in monthly.groupby(level=0):
+                        sub_inst = sub.droplevel(0).sort_index()
+                        if sub_inst.empty:
+                            continue
+                        # extract last non-null EMA values for instrument
+                        try:
+                            v60 = sub_inst["$EMA60"].dropna()
+                            if not v60.empty:
+                                m_ema60[inst] = float(v60.iloc[-1])
+                        except Exception:
+                            pass
+                        try:
+                            v120 = sub_inst["$EMA120"].dropna()
+                            if not v120.empty:
+                                m_ema120[inst] = float(v120.iloc[-1])
+                        except Exception:
+                            pass
+                    # if we populated any EMAs, stop attempting further providers
+                    if m_ema60 or m_ema120:
+                        break
+                except Exception:
+                    # try next provider
+                    continue
+            if m_ema60:
+                ema60_last = pd.Series(m_ema60).reindex(close_df.columns)
+            if m_ema120:
+                ema120_last = pd.Series(m_ema120).reindex(close_df.columns)
+        except Exception:
+            print("Warning: failed to compute long-term EMAs for exclude_ema_downtrend filter")
+            pass
+        finally:
+            if switched:
+                try:
+                    qlib.init(provider_uri=orig_provider, region=orig_region)
+                except Exception:
+                    pass
+
     mask = pd.Series(True, index=close_df.columns, dtype=bool)
+    applied_masks: List[str] = []
 
     def _mask_ge(cur_mask: pd.Series, series: pd.Series, thresh: float, fill_missing_true: bool = False) -> pd.Series:
         cond = series.reindex(cur_mask.index)
@@ -154,15 +232,33 @@ def filter_instruments_by_conditions(
         return cur_mask & cond
 
     if min_amount is not None:
+        applied_masks.append(f"min_amount>={min_amount}")
         mask = _mask_ge(mask, last_amount, min_amount)
     if min_avg_amount is not None:
+        applied_masks.append(f"min_avg_amount>={min_avg_amount} (window={avg_amount_window})")
         mask = _mask_ge(mask, avg_amount, min_avg_amount)
     if min_turnover is not None and turnover_median is not None:
+        applied_masks.append(f"min_turnover>={min_turnover} (window={turnover_window})")
         mask = _mask_ge(mask, turnover_median, min_turnover, fill_missing_true=allow_missing_shares)
     if min_price is not None:
+        applied_masks.append(f"min_price>={min_price}")
         mask = _mask_ge(mask, price_last, min_price)
     if max_price is not None:
+        applied_masks.append(f"max_price<={max_price}")
         mask = _mask_le(mask, price_last, max_price)
+
+    # exclude long-term downtrend stocks (EMA120 > EMA60) if requested
+    if exclude_ema_downtrend:
+        # only apply EMA filter if monthly EMAs are available; otherwise skip
+        if ema60_last.isna().all() and ema120_last.isna().all():
+            # no monthly EMA available, skip EMA filtering
+            applied_masks.append("exclude_ema_downtrend requested but monthly EMAs missing (skipped)")
+            print("Warning: exclude_ema_downtrend requested but monthly EMAs are all missing; skipping this filter")
+        else:
+            applied_masks.append("exclude_ema_downtrend (EMA120<=EMA60)")
+            cond = ema120_last <= ema60_last
+            cond = cond.fillna(False)
+            mask = mask & cond
 
     mask = mask.fillna(False)
     keep_insts = mask[mask].index.astype(str).tolist()
@@ -180,12 +276,16 @@ def filter_instruments_by_conditions(
         
         "min_price": min_price,
         "max_price": max_price,
+        "exclude_ema_downtrend": exclude_ema_downtrend,
+        "applied_masks": applied_masks,
     }
 
     metrics = pd.DataFrame(index=close_df.columns)
     metrics["amount"] = last_amount
     metrics["avg_amount"] = avg_amount
     metrics["price"] = price_last
+    metrics["ema60"] = ema60_last
+    metrics["ema120"] = ema120_last
     if turnover_median is not None:
         metrics["turnover"] = turnover_median
     info["metrics"] = metrics
@@ -203,8 +303,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--turnover-window", type=int, default=20, help="rolling window for median turnover")
     parser.add_argument("--min-price", type=float, default=None, help="minimum last close price")
     parser.add_argument("--max-price", type=float, default=None, help="maximum last close price")
+    parser.add_argument(
+        "--exclude-ema-downtrend",
+        action="store_true",
+        help="exclude instruments where EMA120 > EMA60 (long-term downtrend)",
+    )
     parser.add_argument("--output", default=None, help="optional CSV path to save filtered instruments with metrics")
     parser.add_argument("--allow-missing-shares", action="store_true", help="keep stocks without shares data when using turnover filters")
+    parser.add_argument("--month-provider-uri", default="~/.qlib/qlib_data/hk_data_1mo", help="optional qlib data dir for monthly features (e.g. ~/.qlib/qlib_data/hk_data_1mo)")
+    parser.add_argument("--year-provider-uri", default="~/.qlib/qlib_data/hk_data_1y", help="optional qlib data dir for yearly features (e.g. ~/.qlib/qlib_data/hk_data_1y)")
     return parser.parse_args()
 
 
@@ -221,6 +328,9 @@ def main():
         turnover_window=args.turnover_window,
         min_price=args.min_price,
         max_price=args.max_price,
+        exclude_ema_downtrend=args.exclude_ema_downtrend,
+        month_provider_uri=args.month_provider_uri,
+        year_provider_uri=args.year_provider_uri,
         auto_init=True,
         allow_missing_shares=args.allow_missing_shares,
     )
@@ -232,6 +342,9 @@ def main():
     print("Sample:", info.get("sample", []))
     print("Result list first 10 instruments:")
     print("\n".join(keep_insts[:10]))
+    # print which masks/filters were applied
+    applied = info.get("applied_masks", [])
+    print("Applied filters:", ", ".join(applied) if applied else "none")
 
     out_path = args.output
     if out_path and "metrics" in info:
