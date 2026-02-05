@@ -21,6 +21,44 @@ import numpy as np
 import os
 
 HK_BENCH = "800000.HK"  # ^HSI 被存成 800000.HK
+DAY_PROVIDER_URI = "~/.qlib/qlib_data/hk_data"
+MONTH_PROVIDER_URI = r"C:\Users\kennethlao\.qlib\qlib_data\hk_data_1mo"
+
+
+def pre_cache_indicator_data(insts, start_time, end_time):
+    """Pre-cache day and monthly indicators for the given instruments.
+
+    Note:
+    - Day data uses freq="day".
+    - Monthly data must NOT use freq.
+    - Provider is switched to monthly first, then back to day.
+    """
+    insts = list(dict.fromkeys(insts))
+    if not insts:
+        return {"day": pd.DataFrame(), "month": pd.DataFrame()}
+
+    # monthly first (no freq)
+    qlib.init(provider_uri=MONTH_PROVIDER_URI, region=REG_HK)
+    month_fields = ["$EMA5", "$EMA10", "$EMA20", "$MACD", "$EMA60", "$EMA120"]
+    month_df = D.features(insts, month_fields, start_time=start_time, end_time=end_time)
+
+    # day provider (freq="day")
+    qlib.init(provider_uri=DAY_PROVIDER_URI, region=REG_HK)
+    day_fields = [
+        "$DIF",
+        "$DEA",
+        "$MACD",
+        "$RSI",
+        "$KDJ_K",
+        "$KDJ_D",
+        "$MFI",
+        "$EMA10",
+        "$EMA60",
+        "$EMA120",
+        "$volume",
+    ]
+    day_df = D.features(insts, day_fields, start_time=start_time, end_time=end_time, freq="day", disk_cache=True)
+    return {"day": day_df, "month": month_df}
 
 # 簡易的 HK Alpha158+LGB 配置（可以依需要調整）
 HK_GBDT_TASK = {
@@ -147,7 +185,7 @@ def compute_liquid_instruments(liq_threshold=1_000_000, liq_window=20, handler_e
 
 
 if __name__ == "__main__":
-    provider_uri = "~/.qlib/qlib_data/hk_data"  # HK 資料目錄
+    provider_uri = DAY_PROVIDER_URI  # HK day 資料目錄
     GetData().qlib_data(target_dir=provider_uri, region=REG_HK, exists_skip=True)
     qlib.init(provider_uri=provider_uri, region=REG_HK)
     # Determine last trading day from qlib calendar and update task/backtest dates
@@ -175,13 +213,13 @@ if __name__ == "__main__":
     # --- Liquidity filter: read precomputed CSV; fallback to legacy ---
     handler_kwargs = HK_GBDT_TASK["dataset"]["kwargs"]["handler"]["kwargs"]
     try:
-        csv_path = os.path.abspath(os.path.join(os.getcwd(), "instrument_filtered.csv"))
+        csv_path = os.path.abspath(os.path.join(os.getcwd(), "instrument_filtered_bt.csv"))
         if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"instrument_filtered.csv not found at {csv_path}")
+            raise FileNotFoundError(f"instrument_filtered_bt.csv not found at {csv_path}")
 
         df = pd.read_csv(csv_path)
         if df.empty:
-            raise RuntimeError(f"instrument_filtered.csv is empty at {csv_path}")
+            raise RuntimeError(f"instrument_filtered_bt.csv is empty at {csv_path}")
 
         inst_col = "instrument" if "instrument" in df.columns else df.columns[0]
         keep_insts = df[inst_col].astype(str).tolist()
@@ -212,6 +250,15 @@ if __name__ == "__main__":
             f"Liquidity filter (fallback): kept {info['kept_count']} / {info['orig_count']} instruments ({info['pct']:.2f}%)"
         )
         print("Sample kept instruments:", info["sample"])
+
+    # Pre-cache day/month indicator data for filtered instruments (day uses freq="day", month uses no freq)
+    indicator_data = pre_cache_indicator_data(
+        keep_insts,
+        start_time=handler_kwargs.get("start_time", "2005-01-01"),
+        end_time=last_day,
+    )
+    # Ensure day provider active for remaining workflow
+    qlib.init(provider_uri=provider_uri, region=REG_HK)
 
     if len(keep_insts) == 0:
         import warnings
@@ -268,14 +315,15 @@ if __name__ == "__main__":
             },
         },
         "strategy": {
-            "class": "TopkDropoutStrategy",
+            "class": "MACDTopkDropoutStrategy_v2",
             "module_path": "qlib.contrib.strategy.signal_strategy",
             "kwargs": {
                 "signal": (model, dataset),
                 "topk": 12,
                 "n_drop": 2,
+                "indicator_data": indicator_data,
                 "only_tradable": True,
-                "forbid_all_trade_at_limit": True
+                "forbid_all_trade_at_limit": True,
             },
         },
         "backtest": {

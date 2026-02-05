@@ -295,17 +295,12 @@ class TopkDropoutStrategy(BaseSignalStrategy):
             buy_order_list.append(buy_order)
         return TradeDecisionWO(sell_order_list + buy_order_list, self)
 
+class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
+    """MACD Topk Dropout Strategy v2.
 
-class MACDTopkDropoutStrategy(TopkDropoutStrategy):
-    """TopkDropout with MACD-based buy/sell gating.
-
-    - Buy when DIF crosses above DEA and DIF>0 (bullish) and rank by score.
-    - Weekly MACD filter: buy only if weekly DIF>0 and DEA>0 for the current week.
-    - Sell when DIF crosses below DEA and DIF<0 (bearish), capped by n_drop.
-    - Sell when MFI is overbought and DIF>0 and DEA>0.
-    - If no bullish candidates, do nothing (keep current holdings; do not force-fill topk).
-    - If bullish candidates exist, attempt swaps using available bearish names; do not force fill beyond available bullish names.
-    - Other behaviors (tradable check, hold_thresh, limit handling) follow TopkDropoutStrategy.
+    - No internal indicator cache or indicator computation.
+    - All indicator data is provided by workflow through args (indicator_data).
+    - Keeps the same buy/sell trigger logic as MACDTopkDropoutStrategy.
     """
 
     def __init__(
@@ -313,30 +308,22 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         *,
         topk,
         n_drop,
-        macd_fast: int = 12,
-        macd_slow: int = 26,
-        macd_signal: int = 9,
         rsi_overbought: float = 70.0,
         mfi_overbought: float = 80.0,
         kdj_overbought: float = 80.0,
         kdj_oversold: float = 20.0,
-        stop_loss_pct: float = 0.20,
-        #stop_loss_pct: Optional[float] = None,
+        stop_loss_pct: float = 0.30,
         initial_risk_degree: float = 0.5,
         ramp_steps: int = 5,
         take_profit_pct: float = 1.0,
-        take_profit_sell_ratio: float = 0.5,
-        trailing_stop_drawdown: float = 0.30,
+        take_profit_sell_ratio: float = 0.50,
+        trailing_stop_drawdown: float = 0.20,
         min_turnover: float = 0.001,
-        #min_turnover: Optional[float] = None,
         allow_missing_shares: bool = False,
-        weekly_provider_uri: Optional[str] = None,
+        indicator_data: Optional[Dict[str, pd.DataFrame]] = None,
         **kwargs,
     ):
         super().__init__(topk=topk, n_drop=n_drop, **kwargs)
-        self.macd_fast = macd_fast
-        self.macd_slow = macd_slow
-        self.macd_signal = macd_signal
         self.rsi_overbought = rsi_overbought
         self.mfi_overbought = mfi_overbought
         self.kdj_overbought = kdj_overbought
@@ -349,26 +336,21 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         self.trailing_stop_drawdown = trailing_stop_drawdown
         self.min_turnover = min_turnover
         self.allow_missing_shares = allow_missing_shares
-        self.weekly_provider_uri = weekly_provider_uri
-        self._macd_feat_cache: Optional[pd.DataFrame] = None
-        self._macd_cache_insts: Set[str] = set()
-        self._macd_cache_start: Optional[pd.Timestamp] = None
-        self._macd_cache_end: Optional[pd.Timestamp] = None
-        self._issued_shares: Optional[pd.Series] = None
-        self._issued_shares_loaded: bool = False
-        self._turnover_cache: Dict[pd.Timestamp, pd.Series] = {}
-        self._turnover_cache_all: Optional[pd.Series] = None
-        self._turnover_cache_insts: Set[str] = set()
-        self._turnover_cache_start: Optional[pd.Timestamp] = None
-        self._turnover_cache_end: Optional[pd.Timestamp] = None
-        self._weekly_feat_cache: Optional[pd.DataFrame] = None
-        self._weekly_cache_insts: Set[str] = set()
-        self._weekly_cache_start: Optional[pd.Timestamp] = None
-        self._weekly_cache_end: Optional[pd.Timestamp] = None
-        self._weekly_cache_ready: bool = False
+        self.indicator_data = indicator_data or {}
+        # Cache normalized indicator DataFrames once at initialization
+        try:
+            self._cached_day_df = self._normalize_indicator_df(self._get_indicator_df("day"))
+        except Exception:
+            self._cached_day_df = pd.DataFrame()
+        try:
+            self._cached_month_df = self._normalize_indicator_df(self._get_indicator_df("month"))
+        except Exception:
+            self._cached_month_df = pd.DataFrame()
         # take-profit/trailing-stop tracking
         self._tp_holdout: Set[str] = set()
         self._tp_high: Dict[str, float] = {}
+        self._issued_shares: Optional[pd.Series] = None
+        self._issued_shares_loaded: bool = False
 
     def _load_issued_shares(self) -> pd.Series:
         if self._issued_shares_loaded:
@@ -378,16 +360,10 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
             from qlib.config import C
 
             provider_uri = getattr(C, "provider_uri", None)
-            # qlib may set provider_uri as a mapping (e.g. {'__DEFAULT_FREQ': Path(...)})
-            try:
-                if isinstance(provider_uri, dict):
-                    provider_uri = provider_uri.get("__DEFAULT_FREQ") or next(iter(provider_uri.values()), None)
-                if provider_uri is not None and not isinstance(provider_uri, str):
-                    provider_uri = str(provider_uri)
-            except Exception:
-                pass
-            logger = get_module_logger("MACDTopkDropoutStrategy")
-            logger.debug("resolved provider_uri for issued_shares: %s", provider_uri)
+            if isinstance(provider_uri, dict):
+                provider_uri = provider_uri.get("__DEFAULT_FREQ") or next(iter(provider_uri.values()), None)
+            if provider_uri is not None and not isinstance(provider_uri, str):
+                provider_uri = str(provider_uri)
         except Exception:
             provider_uri = None
         if not provider_uri:
@@ -417,417 +393,207 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
             self._issued_shares = pd.Series(dtype=float)
             return self._issued_shares
 
+    def _get_indicator_df(self, key: str) -> pd.DataFrame:
+        df = self.indicator_data.get(key)
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+    def _normalize_indicator_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        if isinstance(df.index, pd.MultiIndex):
+            names = list(df.index.names)
+            if "instrument" in names and "datetime" in names:
+                df = df.reorder_levels(["instrument", "datetime"]).sort_index()
+        return df
+
+    def _compute_macd_flags(self, instruments: List[str], end_time) -> Dict[str, Dict[str, bool]]:
+        # use cached normalized DataFrames initialized at construction
+        df_all = self._cached_day_df if hasattr(self, "_cached_day_df") else self._normalize_indicator_df(self._get_indicator_df("day"))
+        df_month = self._cached_month_df if hasattr(self, "_cached_month_df") else self._normalize_indicator_df(self._get_indicator_df("month"))
+        if not instruments or df_all.empty:
+            print("No instruments or indicator data available for MACD flag computation.")
+            return {}
+        end_ts = pd.Timestamp(end_time)
+        flags: Dict[str, Dict[str, bool]] = {}
+
+        for inst in instruments:
+            try:
+                sub = df_all.xs(inst, level="instrument")
+            except Exception:
+                continue
+            try:
+                if isinstance(sub.index, pd.DatetimeIndex):
+                    sub = sub[sub.index <= end_ts]
+                if sub.empty:
+                    continue
+                row = sub.iloc[-1]
+                prev_row = sub.iloc[-2] if len(sub) >= 2 else None
+                prev_row2 = sub.iloc[-3] if len(sub) >= 3 else None
+                prev_row3 = sub.iloc[-4] if len(sub) >= 4 else None
+                dif = float(row.get("$DIF")) if "$DIF" in row else None
+                dea = float(row.get("$DEA")) if "$DEA" in row else None
+                dif_prev = float(prev_row.get("$DIF")) if prev_row is not None and "$DIF" in prev_row else None
+                dea_prev = float(prev_row.get("$DEA")) if prev_row is not None and "$DEA" in prev_row else None
+                macd = float(row.get("$MACD")) if "$MACD" in row else None
+                macd_prev = float(prev_row.get("$MACD")) if prev_row is not None and "$MACD" in prev_row else None
+                macd_prev2 = float(prev_row2.get("$MACD")) if prev_row2 is not None and "$MACD" in prev_row2 else None
+                macd_prev3 = float(prev_row3.get("$MACD")) if prev_row3 is not None and "$MACD" in prev_row3 else None
+                rsi = float(row.get("$RSI")) if "$RSI" in row else None
+                kdj_k = float(row.get("$KDJ_K")) if "$KDJ_K" in row else None
+                kdj_d = float(row.get("$KDJ_D")) if "$KDJ_D" in row else None
+                mfi = float(row.get("$MFI")) if "$MFI" in row else None
+                kdj_k_prev = float(prev_row.get("$KDJ_K")) if prev_row is not None and "$KDJ_K" in prev_row else None
+                kdj_d_prev = float(prev_row.get("$KDJ_D")) if prev_row is not None and "$KDJ_D" in prev_row else None
+                ema10 = float(row.get("$EMA10")) if "$EMA10" in row else None
+                ema60 = float(row.get("$EMA60")) if "$EMA60" in row else None
+                ema120 = float(row.get("$EMA120")) if "$EMA120" in row else None
+
+                # monthly EMA alignment (EMA5 > EMA10 > EMA20) and MACD not two consecutive declines
+                monthly_ok = True
+                if not df_month.empty:
+                    try:
+                        sub_m = df_month.xs(inst, level="instrument")
+                        if isinstance(sub_m.index, pd.DatetimeIndex):
+                            sub_m = sub_m[sub_m.index <= end_ts]
+                        if not sub_m.empty:
+                            row_m = sub_m.iloc[-1]
+                            prev_row_m = sub_m.iloc[-2] if len(sub_m) >= 2 else None
+                            prev_row_m2 = sub_m.iloc[-3] if len(sub_m) >= 3 else None
+                            ema5_m = float(row_m.get("$EMA5")) if "$EMA5" in row_m else None
+                            ema10_m = float(row_m.get("$EMA10")) if "$EMA10" in row_m else None
+                            ema20_m = float(row_m.get("$EMA20")) if "$EMA20" in row_m else None
+                            macd_m = float(row_m.get("$MACD")) if "$MACD" in row_m else None
+                            macd_m_prev = (
+                                float(prev_row_m.get("$MACD"))
+                                if prev_row_m is not None and "$MACD" in prev_row_m
+                                else None
+                            )
+                            macd_m_prev2 = (
+                                float(prev_row_m2.get("$MACD"))
+                                if prev_row_m2 is not None and "$MACD" in prev_row_m2
+                                else None
+                            )
+                            if ema5_m is None or ema10_m is None or ema20_m is None:
+                                monthly_ok = False
+                            else:
+                                monthly_ok = ema5_m > ema10_m > ema20_m
+                            if monthly_ok and macd_m is not None and macd_m_prev is not None and macd_m_prev2 is not None:
+                                monthly_ok = not (macd_m < macd_m_prev < macd_m_prev2)
+                    except Exception:
+                        monthly_ok = False
+                else:
+                    monthly_ok = False
+
+                vol_ok = False
+                try:
+                    if "$volume" in sub.columns:
+                        vol_series = pd.to_numeric(sub["$volume"], errors="coerce")
+                        vol_recent = vol_series[vol_series.index <= end_ts].tail(10)
+                        if len(vol_recent) >= 9:
+                            good_days = (vol_recent.fillna(0) > 0).sum()
+                            vol_ok = int(good_days) >= 9
+                        else:
+                            vol_ok = False
+                except Exception:
+                    vol_ok = False
+            except Exception:
+                dif = dea = dif_prev = dea_prev = rsi = kdj_k = kdj_d = mfi = kdj_k_prev = kdj_d_prev = None
+                macd = macd_prev = macd_prev2 = macd_prev3 = None
+                ema10 = ema60 = ema120 = None
+            if None in (dif, dea, dif_prev, dea_prev):
+                continue
+
+            macd_down_2 = (
+                macd is not None
+                and macd_prev is not None
+                and macd_prev2 is not None
+                and macd < macd_prev < macd_prev2
+            )
+            ema_bear = (
+                ema10 is not None
+                and ema60 is not None
+                and ema120 is not None
+                and ema10 < ema60 < ema120
+            )
+
+            macd_buy = (
+                dif > dea
+                and dif > 0
+                and not macd_down_2
+                and vol_ok
+                and monthly_ok
+            )
+            kdj_buy = (
+                kdj_k is not None
+                and kdj_d is not None
+                and kdj_k_prev is not None
+                and kdj_k_prev <= self.kdj_oversold
+                and kdj_k > kdj_d
+            )
+            kdj_golden_buy = (
+                kdj_k is not None
+                and kdj_d is not None
+                and kdj_k_prev is not None
+                and kdj_d_prev is not None
+                and kdj_k_prev <= kdj_d_prev
+                and kdj_k > kdj_d
+            )
+
+            buy = macd_buy
+            macd_sell = dif_prev >= dea_prev and dif < dea and (rsi is not None and rsi >= self.rsi_overbought)
+            kdj_golden_sell = (
+                kdj_k is not None
+                and kdj_d is not None
+                and kdj_k_prev is not None
+                and kdj_d_prev is not None
+                and kdj_k_prev >= self.kdj_overbought
+                and kdj_k_prev >= kdj_d_prev
+                and kdj_k < kdj_d
+            )
+            mfi_sell = (
+                mfi is not None
+                and mfi >= self.mfi_overbought
+                and dif > 0
+                and dea > 0
+            )
+            sell = []
+            flags[inst] = {"buy": bool(buy), "sell": bool(sell)}
+        return flags
+
     def _get_turnover_mask(self, instruments: List[str], trade_date) -> pd.Series:
         if not instruments:
             return pd.Series(dtype=bool)
         shares = self._load_issued_shares()
         if shares.empty:
             return pd.Series(self.allow_missing_shares, index=pd.Index(instruments, name="instrument"))
-        try:
-            trade_ts = pd.Timestamp(trade_date)
-            turnover_all = self._turnover_cache.get(trade_ts)
-            if turnover_all is None:
-                self._ensure_turnover_cache(list(instruments))
-                if self._turnover_cache_all is None:
-                    return pd.Series(self.allow_missing_shares, index=pd.Index(instruments, name="instrument"))
-                try:
-                    turnover_all = self._turnover_cache_all.xs(trade_ts, level="datetime")
-                    self._turnover_cache[trade_ts] = turnover_all
-                except Exception:
-                    return pd.Series(self.allow_missing_shares, index=pd.Index(instruments, name="instrument"))
-
-            turnover = turnover_all.reindex(instruments)
-            mask = turnover >= float(self.min_turnover)
-            if self.allow_missing_shares:
-                mask = mask.fillna(True)
-            else:
-                mask = mask.fillna(False)
-            return mask
-        except Exception:
-            print("Unexpected error in _get_turnover_mask for %s", trade_date)
+        df_all = self._normalize_indicator_df(self._get_indicator_df("day"))
+        if df_all.empty or "$volume" not in df_all.columns:
             return pd.Series(self.allow_missing_shares, index=pd.Index(instruments, name="instrument"))
-
-    def _ensure_turnover_cache(self, instruments: List[str]) -> Optional[pd.Series]:
-        insts = list(dict.fromkeys(instruments))
-        if not insts:
-            return None
-        if self._turnover_cache_all is None:
+        trade_ts = pd.Timestamp(trade_date)
+        mask = pd.Series(False, index=pd.Index(instruments, name="instrument"))
+        for inst in instruments:
             try:
-                trade_len = self.trade_calendar.get_trade_len()
-                start_ts = self.trade_calendar.get_step_time(0)[0]
-                end_ts = self.trade_calendar.get_step_time(trade_len - 1)[0]
+                sub = df_all.xs(inst, level="instrument")
             except Exception:
-                start_ts = None
-                end_ts = None
-            self._turnover_cache_start = pd.Timestamp(start_ts) if start_ts is not None else None
-            self._turnover_cache_end = pd.Timestamp(end_ts) if end_ts is not None else None
-            df_src = None
-            if self._macd_feat_cache is not None and "$volume" in self._macd_feat_cache.columns:
-                missing_macd = [i for i in insts if i not in self._macd_cache_insts]
-                if missing_macd:
-                    self._ensure_macd_cache(missing_macd)
-                if self._macd_feat_cache is not None and "$volume" in self._macd_feat_cache.columns:
-                    df_src = self._macd_feat_cache
-            if df_src is None:
-                feat = D.features(
-                    insts,
-                    ["$volume"],
-                    start_time=self._turnover_cache_start,
-                    end_time=self._turnover_cache_end,
-                    freq="day",
-                    disk_cache=True,
-                )
-                if feat is None or feat.empty:
-                    return None
-                vol = pd.to_numeric(feat["$volume"], errors="coerce")
-                vol = vol.sort_index()
-            else:
-                vol = pd.to_numeric(df_src["$volume"], errors="coerce")
-                vol = vol.sort_index()
-            shares = self._load_issued_shares()
-            shares_all = shares.reindex(vol.index.get_level_values("instrument")).values
-            turnover = vol / shares_all
-            self._turnover_cache_all = turnover
-            self._turnover_cache_insts = set(vol.index.get_level_values("instrument"))
-            return self._turnover_cache_all
-
-        missing = [i for i in insts if i not in self._turnover_cache_insts]
-        if missing:
-            df_src = None
-            if self._macd_feat_cache is not None and "$volume" in self._macd_feat_cache.columns:
-                missing_macd = [i for i in missing if i not in self._macd_cache_insts]
-                if missing_macd:
-                    self._ensure_macd_cache(missing_macd)
-                if self._macd_feat_cache is not None and "$volume" in self._macd_feat_cache.columns:
-                    df_src = self._macd_feat_cache
-            if df_src is None:
-                feat = D.features(
-                    missing,
-                    ["$volume"],
-                    start_time=self._turnover_cache_start,
-                    end_time=self._turnover_cache_end,
-                    freq="day",
-                    disk_cache=True,
-                )
-                if feat is not None and not feat.empty:
-                    vol = pd.to_numeric(feat["$volume"], errors="coerce")
-                    vol = vol.sort_index()
-                    shares = self._load_issued_shares()
-                    shares_all = shares.reindex(vol.index.get_level_values("instrument")).values
-                    turnover = vol / shares_all
-                    self._turnover_cache_all = pd.concat([self._turnover_cache_all, turnover], axis=0)
-                    self._turnover_cache_insts.update(missing)
-            else:
-                vol = pd.to_numeric(df_src["$volume"], errors="coerce")
-                vol = vol.sort_index()
-                vol_missing = vol[vol.index.get_level_values("instrument").isin(missing)]
-                if not vol_missing.empty:
-                    shares = self._load_issued_shares()
-                    shares_all = shares.reindex(vol_missing.index.get_level_values("instrument")).values
-                    turnover = vol_missing / shares_all
-                    self._turnover_cache_all = pd.concat([self._turnover_cache_all, turnover], axis=0)
-                    self._turnover_cache_insts.update(missing)
-        return self._turnover_cache_all
-
-    def _ensure_macd_cache(self, instruments: List[str]) -> Optional[pd.DataFrame]:
-        fields = [
-            "$DIF",
-            "$DEA",
-            "$MACD",
-            "$RSI",
-            "$KDJ_K",
-            "$KDJ_D",
-            "$MFI",
-        ]
-        # include volume so turnover cache can reuse this fetch
-        fields = ["$volume"] + fields
-        # include shorter/longer EMAs so we can detect EMA bearish trend (10<60<120)
-        fields = ["$EMA10", "$EMA60", "$EMA120"] + fields
-        insts = list(dict.fromkeys(instruments))
-        if not insts:
-            return None
-
-        if self._macd_feat_cache is None:
+                continue
             try:
-                trade_len = self.trade_calendar.get_trade_len()
-                start_ts = self.trade_calendar.get_step_time(0)[0]
-                end_ts = self.trade_calendar.get_step_time(trade_len - 1)[0]
+                sub = sub[sub.index <= trade_ts]
+                if sub.empty:
+                    continue
+                vol_series = pd.to_numeric(sub["$volume"], errors="coerce")
+                med_vol = vol_series.tail(20).median()
+                share = shares.get(inst)
+                if share is None or pd.isna(share):
+                    continue
+                turnover = med_vol / share
+                mask.loc[inst] = turnover >= float(self.min_turnover)
             except Exception:
-                start_ts = None
-                end_ts = None
-            self._macd_cache_start = pd.Timestamp(start_ts) if start_ts is not None else None
-            self._macd_cache_end = pd.Timestamp(end_ts) if end_ts is not None else None
-            df = D.features(
-                insts,
-                fields,
-                start_time=self._macd_cache_start,
-                end_time=self._macd_cache_end,
-                freq="day",
-                disk_cache=True,
-            )
-            if df is None or df.empty:
-                return None
-            self._macd_feat_cache = df
-            self._macd_cache_insts = set(insts)
-            return self._macd_feat_cache
-
-        missing = [i for i in insts if i not in self._macd_cache_insts]
-        if missing:
-            df_new = D.features(
-                missing,
-                fields,
-                start_time=self._macd_cache_start,
-                end_time=self._macd_cache_end,
-                freq="day",
-                disk_cache=True,
-            )
-            if df_new is not None and not df_new.empty:
-                self._macd_feat_cache = pd.concat([self._macd_feat_cache, df_new], axis=0)
-                self._macd_cache_insts.update(missing)
-        return self._macd_feat_cache
-    """
-    def _calc_weekly_dif_dea(self, close_s: pd.Series) -> Tuple[pd.Series, pd.Series]:
-        close_s = pd.to_numeric(close_s, errors="coerce")
-        ema_fast = close_s.ewm(span=self.macd_fast, adjust=False).mean()
-        ema_slow = close_s.ewm(span=self.macd_slow, adjust=False).mean()
-        dif = ema_fast - ema_slow
-        dea = dif.ewm(span=self.macd_signal, adjust=False).mean()
-        return dif, dea
-
-    def _ensure_weekly_cache(self, instruments: List[str]) -> Optional[pd.DataFrame]:
-        insts = list(dict.fromkeys(instruments))
-        if not insts:
-            return None
-        if not self.weekly_provider_uri:
-            raise ValueError("weekly_provider_uri is required for weekly MACD gating")
-
-        def _fetch_weekly(inst_list: List[str]) -> Optional[pd.DataFrame]:
-            if not inst_list:
-                return None
-            try:
-                from qlib.config import C
-
-                orig_provider = getattr(C, "provider_uri", None)
-                orig_region = getattr(C, "region", None)
-            except Exception:
-                orig_provider = None
-                orig_region = None
-
-            switched = False
-            try:
-                if orig_provider != self.weekly_provider_uri:
-                    qlib.init(provider_uri=self.weekly_provider_uri, region=orig_region)
-                    switched = True
-                df = D.features(
-                    inst_list,
-                    ["$close"],
-                    start_time=self._weekly_cache_start,
-                    end_time=self._weekly_cache_end,
-                    freq="week",
-                    disk_cache=True,
-                )
-                if df is None or df.empty:
-                    raise RuntimeError("weekly data not found")
-                return df
-            finally:
-                if switched and orig_provider is not None:
-                    try:
-                        qlib.init(provider_uri=orig_provider, region=orig_region)
-                    except Exception:
-                        pass
-
-        if self._weekly_feat_cache is None:
-            try:
-                trade_len = self.trade_calendar.get_trade_len()
-                start_ts = self.trade_calendar.get_step_time(0)[0]
-                end_ts = self.trade_calendar.get_step_time(trade_len - 1)[0]
-            except Exception:
-                start_ts = None
-                end_ts = None
-            self._weekly_cache_start = pd.Timestamp(start_ts) if start_ts is not None else None
-            self._weekly_cache_end = pd.Timestamp(end_ts) if end_ts is not None else None
-            df = _fetch_weekly(insts)
-            self._weekly_feat_cache = df
-            self._weekly_cache_insts = set(insts)
-            self._weekly_cache_ready = True
+                continue
+        if self.allow_missing_shares:
+            mask = mask.fillna(True)
         else:
-            missing = [i for i in insts if i not in self._weekly_cache_insts]
-            if missing:
-                df_new = _fetch_weekly(missing)
-                self._weekly_feat_cache = pd.concat([self._weekly_feat_cache, df_new], axis=0)
-                self._weekly_cache_insts.update(missing)
-
-        if self._weekly_feat_cache is None or self._weekly_feat_cache.empty:
-            raise RuntimeError("weekly data not found")
-
-        if "$DIF" not in self._weekly_feat_cache.columns or "$DEA" not in self._weekly_feat_cache.columns:
-            self._weekly_feat_cache["$DIF"] = np.nan
-            self._weekly_feat_cache["$DEA"] = np.nan
-
-        try:
-            df_all = self._weekly_feat_cache
-            if isinstance(df_all.index, pd.MultiIndex):
-                for inst, sub in df_all.groupby(level=0):
-                    sub_inst = sub.droplevel(0)
-                    if "$close" not in sub_inst.columns:
-                        continue
-                    dif_s, dea_s = self._calc_weekly_dif_dea(sub_inst["$close"])
-                    df_all.loc[(inst, sub_inst.index), "$DIF"] = dif_s.values
-                    df_all.loc[(inst, sub_inst.index), "$DEA"] = dea_s.values
-                self._weekly_feat_cache = df_all
-        except Exception:
-            pass
-
-        return self._weekly_feat_cache
-    """
-    def _compute_macd_flags(self, instruments: List[str], end_time) -> Dict[str, Dict[str, bool]]:
-        # 1) Try precomputed bin features (DIF/DEA/DIF_PREV/DEA_PREV) from D.features
-        if instruments:
-            try:
-                end_ts = pd.Timestamp(end_time)
-                df_all = self._ensure_macd_cache(instruments)
-                if df_all is None or df_all.empty:
-                    return {}
-                #weekly_map: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
-                """
-                weekly_df = self._ensure_weekly_cache(instruments)
-                if weekly_df is not None and not weekly_df.empty and isinstance(weekly_df.index, pd.MultiIndex):
-                    for inst, w_sub in weekly_df.groupby(level=0):
-                        try:
-                            w_inst = w_sub.droplevel(0)
-                            if isinstance(w_inst.index, pd.DatetimeIndex):
-                                w_inst = w_inst[w_inst.index <= end_ts]
-                            if w_inst.empty:
-                                continue
-                            w_row = w_inst.iloc[-1]
-                            w_dif = float(w_row.get("$DIF")) if "$DIF" in w_row else None
-                            w_dea = float(w_row.get("$DEA")) if "$DEA" in w_row else None
-                            weekly_map[inst] = (w_dif, w_dea)
-                        except Exception:
-                            print("Error computing weekly DIF/DEA for inst:", inst)
-                            continue
-                """
-                if isinstance(df_all, pd.DataFrame) and not df_all.empty and isinstance(df_all.index, pd.MultiIndex):
-                    flags: Dict[str, Dict[str, bool]] = {}
-                    for inst, sub in df_all.groupby(level=0):
-                        try:
-                            sub_inst = sub.droplevel(0)
-                            if isinstance(sub_inst.index, pd.DatetimeIndex):
-                                sub_inst = sub_inst[sub_inst.index <= end_ts]
-                            if sub_inst.empty:
-                                continue
-                            row = sub_inst.iloc[-1]
-                            prev_row = sub_inst.iloc[-2] if len(sub_inst) >= 2 else None
-                            prev_row2 = sub_inst.iloc[-3] if len(sub_inst) >= 3 else None
-                            prev_row3 = sub_inst.iloc[-4] if len(sub_inst) >= 4 else None
-                            dif = float(row.get("$DIF")) if "$DIF" in row else None
-                            dea = float(row.get("$DEA")) if "$DEA" in row else None
-                            dif_prev = float(prev_row.get("$DIF")) if prev_row is not None and "$DIF" in prev_row else None
-                            dea_prev = float(prev_row.get("$DEA")) if prev_row is not None and "$DEA" in prev_row else None
-                            macd = float(row.get("$MACD")) if "$MACD" in row else None
-                            macd_prev = float(prev_row.get("$MACD")) if prev_row is not None and "$MACD" in prev_row else None
-                            macd_prev2 = (
-                                float(prev_row2.get("$MACD")) if prev_row2 is not None and "$MACD" in prev_row2 else None
-                            )
-                            macd_prev3 = (
-                                float(prev_row3.get("$MACD")) if prev_row3 is not None and "$MACD" in prev_row3 else None
-                            )
-                            rsi = float(row.get("$RSI")) if "$RSI" in row else None
-                            kdj_k = float(row.get("$KDJ_K")) if "$KDJ_K" in row else None
-                            kdj_d = float(row.get("$KDJ_D")) if "$KDJ_D" in row else None
-                            mfi = float(row.get("$MFI")) if "$MFI" in row else None
-                            kdj_k_prev = (
-                                float(prev_row.get("$KDJ_K")) if prev_row is not None and "$KDJ_K" in prev_row else None
-                            )
-                            kdj_d_prev = (
-                                float(prev_row.get("$KDJ_D")) if prev_row is not None and "$KDJ_D" in prev_row else None
-                            )
-                            ema10 = float(row.get("$EMA10")) if "$EMA10" in row else None
-                            ema60 = float(row.get("$EMA60")) if "$EMA60" in row else None
-                            ema120 = float(row.get("$EMA120")) if "$EMA120" in row else None
-                            # require recent non-zero volume: last ~2 weeks (10 trading days)
-                            vol_ok = False
-                            try:
-                                if "$volume" in sub_inst.columns:
-                                    vol_series = pd.to_numeric(sub_inst["$volume"], errors="coerce")
-                                    vol_recent = vol_series[vol_series.index <= end_ts].tail(10)
-                                    vol_ok = (
-                                        len(vol_recent) >= 10
-                                        and vol_recent.notna().all()
-                                        and (vol_recent > 0).all()
-                                    )
-                            except Exception:
-                                vol_ok = False
-                        except Exception:
-                            dif = dea = dif_prev = dea_prev = rsi = kdj_k = kdj_d = mfi = kdj_k_prev = kdj_d_prev = None
-                            macd = macd_prev = macd_prev2 = macd_prev3 = None
-                        if None in (dif, dea, dif_prev, dea_prev):
-                            continue
-                        #weekly_dif, weekly_dea = weekly_map.get(inst, (None, None))
-                        #weekly_ok = weekly_dif is not None and weekly_dea is not None and weekly_dif > 0
-                        macd_down_2 = (
-                            macd is not None
-                            and macd_prev is not None
-                            and macd_prev2 is not None
-                            and macd < macd_prev < macd_prev2
-                        )
-                        ema_bear = (
-                            ema10 is not None
-                            and ema60 is not None
-                            and ema120 is not None
-                            and ema10 < ema60 < ema120
-                        )
-
-                        macd_buy = (
-                            dif > dea
-                            and dif > 0
-                            and kdj_k > kdj_d
-                            and not macd_down_2
-                            and vol_ok
-                            #and not ema_bear
-                        )
-                        kdj_buy = (
-                            kdj_k is not None
-                            and kdj_d is not None
-                            and kdj_k_prev <= self.kdj_oversold
-                            and kdj_k > kdj_d
-                        )
-
-                        kdj_golden_buy = (
-                            kdj_k is not None
-                            and kdj_d is not None
-                            and kdj_k_prev is not None
-                            and kdj_d_prev is not None
-                            and kdj_k_prev <= kdj_d_prev
-                            and kdj_k > kdj_d
-                        )
-                        #buy = (macd_buy or kdj_golden_buy or kdj_buy) and weekly_ok
-                        buy = macd_buy 
-                        macd_sell = dif_prev >= dea_prev and dif < dea and (rsi is not None and rsi >= self.rsi_overbought)
-                        kdj_golden_sell = (
-                            kdj_k is not None
-                            and kdj_d is not None
-                            and kdj_k_prev is not None
-                            and kdj_d_prev is not None
-                            and kdj_k_prev >= self.kdj_overbought
-                            and kdj_k_prev >= kdj_d_prev
-                            and kdj_k < kdj_d
-                        )
-                        mfi_sell = (
-                            mfi is not None
-                            and mfi >= self.mfi_overbought
-                            and dif > 0
-                            and dea > 0
-                        )
-                        #sell = macd_sell or kdj_golden_sell or mfi_sell
-                        sell=[]
-                        flags[inst] = {"buy": bool(buy), "sell": bool(sell)}
-                    return flags
-            except Exception:
-                # fall through to on-the-fly compute if D.features not available
-                pass
-
-        return {}
+            mask = mask.fillna(False)
+        return mask
 
     def generate_trade_decision(self, execute_result=None):
         trade_step = self.trade_calendar.get_trade_step()
@@ -867,7 +633,6 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                     prev_high = self._tp_high.get(code, cur_price)
                     self._tp_high[code] = max(prev_high, cur_price)
                     if self._tp_high[code] > 0 and cur_price <= self._tp_high[code] * (1 - self.trailing_stop_drawdown):
-                        # sell all remaining on trailing stop
                         try:
                             amt = self.trade_position.get_stock_amount(code=code)
                         except Exception:
@@ -877,7 +642,6 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                             tp_holdout_remove.add(code)
                 continue
 
-            # initial take-profit: +100% gain -> sell 50% and move to holdout list
             if buy_price is not None and cur_price is not None and buy_price > 0:
                 if cur_price >= buy_price * (1 + self.take_profit_pct):
                     try:
@@ -896,7 +660,6 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                             if cur_price is not None:
                                 self._tp_high[code] = cur_price
 
-        # exclude holdout names from TopK rotation
         holdout_set = set(self._tp_holdout) | tp_holdout_add
         current_stock_list = [c for c in current_stock_list_all if c not in holdout_set]
         candidates: Set[str] = set(current_stock_list) | set(pred_score.index.tolist())
@@ -904,12 +667,10 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         bullish = {k for k, v in macd_flags.items() if v.get("buy") and k not in holdout_set}
         bearish = {k for k, v in macd_flags.items() if v.get("sell")}
 
-        # apply turnover filter to buy candidates
         if self.min_turnover is not None and bullish:
             turnover_mask = self._get_turnover_mask(list(bullish), trade_start_time)
             bullish = {k for k in bullish if bool(turnover_mask.get(k, self.allow_missing_shares))}
 
-        # stop-loss: force sell if price drops below buy price by stop_loss_pct
         stop_loss_set: Set[str] = set()
         if self.stop_loss_pct is not None:
             for code in current_stock_list_all:
@@ -933,16 +694,12 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                 if cur_price <= buy_price * (1 - self.stop_loss_pct):
                     stop_loss_set.add(code)
 
-        # If no bullish signals and no stop-loss and no take-profit actions, keep positions unchanged
         if not bullish and not stop_loss_set and not forced_sell_amounts:
             return TradeDecisionWO([], self)
 
-        # rank existing holdings by score (descending)
         last_scored = pred_score.reindex(current_stock_list).sort_values(ascending=False)
         bearish_holdings = last_scored[last_scored.index.isin(bearish)]
-        # always sell holdings that meet sell condition or stop-loss
         sell_list = list(stop_loss_set)
-        # include forced take-profit sells (partial or full)
         for code in forced_sell_amounts.keys():
             if code not in sell_list:
                 sell_list.append(code)
@@ -951,29 +708,24 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
             if code not in sell_set:
                 sell_list.append(code)
                 sell_set.add(code)
-        # if sell count < n_drop, fill remaining sells by bottom scores
         if len(sell_list) < self.n_drop:
             remaining = last_scored[~last_scored.index.isin(sell_set)]
             extra_needed = self.n_drop - len(sell_list)
             extra_sell = list(remaining.sort_values(ascending=True).index[:extra_needed])
             sell_list.extend(extra_sell)
 
-        # buy candidates: bullish not currently held, ranked by score
         bullish_new = pred_score[pred_score.index.isin(bullish) & ~pred_score.index.isin(current_stock_list)]
         bullish_ranked = bullish_new.sort_values(ascending=False)
 
-        # capacity: free slots after planned sells, plus any gap to topk
         sold_effective = len([c for c in sell_list if c in current_stock_list])
         post_sell_holdings = len(current_stock_list) - sold_effective
         open_slots = max(self.topk - post_sell_holdings, 0)
         max_buys = min(len(sell_list) + open_slots, len(bullish_ranked))
         buy_list = list(bullish_ranked.index[:max_buys]) if max_buys > 0 else []
 
-        # if still nothing to buy, keep unchanged (and avoid selling), unless stop-loss or take-profit triggered
         if not buy_list and not stop_loss_set and not forced_sell_amounts:
             return TradeDecisionWO([], self)
 
-        # reuse tradability helpers from parent
         if self.only_tradable:
             def is_tradable(code, direction):
                 return self.trade_exchange.is_stock_tradable(
@@ -991,7 +743,6 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
         buy_order_list = []
         cash = current_temp.get_cash()
 
-        # execute sells first
         time_per_step = self.trade_calendar.get_freq()
         for code in sell_list:
             if not is_tradable(code, None if self.forbid_all_trade_at_limit else OrderDir.SELL):
@@ -1015,7 +766,6 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
                 trade_val, trade_cost, trade_price = self.trade_exchange.deal_order(sell_order, position=current_temp)
                 cash += trade_val - trade_cost
 
-        # allocate cash equally to buys with staged ramp-up from initial_risk_degree
         if self.ramp_steps is not None and self.ramp_steps > 0:
             ramp = min(1.0, self.initial_risk_degree + (1 - self.initial_risk_degree) * (trade_step / self.ramp_steps))
         else:
@@ -1044,7 +794,6 @@ class MACDTopkDropoutStrategy(TopkDropoutStrategy):
             )
             buy_order_list.append(buy_order)
 
-        # update holdout tracking
         if tp_holdout_add:
             self._tp_holdout.update(tp_holdout_add)
         if tp_holdout_remove:

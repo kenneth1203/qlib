@@ -31,7 +31,7 @@ from qlib.constant import REG_CN as REGION_CN
 CUR_DIR = Path(__file__).resolve().parent
 sys.path.append(str(CUR_DIR.parent.parent))
 
-from dump_bin import DumpDataUpdate
+from dump_bin import DumpDataUpdate, DumpDataAll
 from data_collector.base import BaseCollector, BaseNormalize, BaseRun, Normalize
 from data_collector.utils import (
     deco_retry,
@@ -1556,13 +1556,13 @@ class Run(BaseRun):
                     f"week_data=True: dumping bins to {qlib_root.joinpath('hk_data_1w')}, {qlib_root.joinpath('hk_data_1mo')}, {qlib_root.joinpath('hk_data_1y')}"
                 )
                 if indicator:
-                    self._dump_dir(w_ind_dir, qlib_root.joinpath("hk_data_1w"))
-                    self._dump_dir(m_ind_dir, qlib_root.joinpath("hk_data_1mo"))
-                    self._dump_dir(y_ind_dir, qlib_root.joinpath("hk_data_1y"))
+                    self._dump_dir(w_ind_dir, qlib_root.joinpath("hk_data_1w"), full=True)
+                    self._dump_dir(m_ind_dir, qlib_root.joinpath("hk_data_1mo"), full=True)
+                    self._dump_dir(y_ind_dir, qlib_root.joinpath("hk_data_1y"), full=True)
                 else:
-                    self._dump_dir(w_dir, qlib_root.joinpath("hk_data_1w"))
-                    self._dump_dir(m_dir, qlib_root.joinpath("hk_data_1mo"))
-                    self._dump_dir(y_dir, qlib_root.joinpath("hk_data_1y"))
+                    self._dump_dir(w_dir, qlib_root.joinpath("hk_data_1w"), full=True)
+                    self._dump_dir(m_dir, qlib_root.joinpath("hk_data_1mo"), full=True)
+                    self._dump_dir(y_dir, qlib_root.joinpath("hk_data_1y"), full=True)
             except Exception as e:
                 logger.warning(f"HK weekly/monthly/yearly update failed: {e}")
         else:
@@ -1747,15 +1747,23 @@ class Run(BaseRun):
             except Exception as e:
                 logger.warning(f"Resample failed for {csv_path}: {e}")
 
-    def _dump_dir(self, data_path: Path, qlib_dir: Path):
+    def _dump_dir(self, data_path: Path, qlib_dir: Path, full: bool = False):
         if not data_path.exists():
             return
-        _dump = DumpDataUpdate(
-            data_path=str(data_path),
-            qlib_dir=str(qlib_dir),
-            exclude_fields="symbol,date",
-            max_workers=self.max_workers,
-        )
+        if full:
+            _dump = DumpDataAll(
+                data_path=str(data_path),
+                qlib_dir=str(qlib_dir),
+                exclude_fields="symbol,date",
+                max_workers=self.max_workers,
+            )
+        else:
+            _dump = DumpDataUpdate(
+                data_path=str(data_path),
+                qlib_dir=str(qlib_dir),
+                exclude_fields="symbol,date",
+                max_workers=self.max_workers,
+            )
         _dump.dump()
 
 

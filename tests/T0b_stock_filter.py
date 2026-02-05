@@ -142,14 +142,14 @@ def filter_instruments_by_conditions(
 
     price_last = close_df.loc[last_idx]
 
-    # EMA60 and EMA120: only computed from monthly bars if requested.
+    # EMA5 and EMA10: only computed from monthly bars if requested.
     # Do NOT compute daily EMAs here — monthly EMAs will be used when
     # `exclude_ema_downtrend` is requested and `month_provider_uri` is provided.
-    ema60_last = pd.Series(np.nan, index=close_df.columns)
-    ema120_last = pd.Series(np.nan, index=close_df.columns)
+    ema5_last = pd.Series(np.nan, index=close_df.columns)
+    ema10_last = pd.Series(np.nan, index=close_df.columns)
 
     if exclude_ema_downtrend:
-        # Try yearly EMA provider first, fall back to monthly provider if yearly unavailable.
+        # Use monthly EMA provider only (yearly data disabled for now).
         try:
             try:
                 from qlib.config import C
@@ -159,55 +159,42 @@ def filter_instruments_by_conditions(
                 orig_provider = None
                 orig_region = None
             switched = False
-            # build provider list: year first, then month fallback
-            provider_attempts = []
-            if year_provider_uri:
-                provider_attempts.append((year_provider_uri, "year"))
+            m_ema5 = {}
+            m_ema10 = {}
             if month_provider_uri:
-                provider_attempts.append((month_provider_uri, "month"))
-
-            m_ema60 = {}
-            m_ema120 = {}
-            for prov_uri, freq in provider_attempts:
                 try:
-                    if orig_provider != prov_uri:
-                        qlib.init(provider_uri=os.path.expanduser(prov_uri), region=REG_HK)
+                    if orig_provider != month_provider_uri:
+                        qlib.init(provider_uri=os.path.expanduser(month_provider_uri), region=REG_HK)
                         switched = True
-                    # fetch precomputed EMA features from the provider (provider determines frequency)
-                    ema_feats = ["$EMA60", "$EMA120"]
+                    # fetch precomputed EMA features from the monthly provider (no freq)
+                    ema_feats = ["$EMA5", "$EMA10"]
                     monthly = D.features(insts, ema_feats, start_time=start_day, end_time=end_day)
-                    if not (isinstance(monthly, pd.DataFrame) and not monthly.empty and isinstance(monthly.index, pd.MultiIndex)):
-                        # try next provider
-                        continue
-                    for inst, sub in monthly.groupby(level=0):
-                        sub_inst = sub.droplevel(0).sort_index()
-                        if sub_inst.empty:
-                            continue
-                        # extract last non-null EMA values for instrument
-                        try:
-                            v60 = sub_inst["$EMA60"].dropna()
-                            if not v60.empty:
-                                m_ema60[inst] = float(v60.iloc[-1])
-                        except Exception:
-                            pass
-                        try:
-                            v120 = sub_inst["$EMA120"].dropna()
-                            if not v120.empty:
-                                m_ema120[inst] = float(v120.iloc[-1])
-                        except Exception:
-                            pass
-                    # if we populated any EMAs, stop attempting further providers
-                    if m_ema60 or m_ema120:
-                        break
+                    if isinstance(monthly, pd.DataFrame) and not monthly.empty and isinstance(monthly.index, pd.MultiIndex):
+                        for inst, sub in monthly.groupby(level=0):
+                            sub_inst = sub.droplevel(0).sort_index()
+                            if sub_inst.empty:
+                                continue
+                            # extract last non-null EMA values for instrument
+                            try:
+                                v5 = sub_inst["$EMA5"].dropna()
+                                if not v5.empty:
+                                    m_ema5[inst] = float(v5.iloc[-1])
+                            except Exception:
+                                pass
+                            try:
+                                v10 = sub_inst["$EMA10"].dropna()
+                                if not v10.empty:
+                                    m_ema10[inst] = float(v10.iloc[-1])
+                            except Exception:
+                                pass
                 except Exception:
-                    # try next provider
-                    continue
-            if m_ema60:
-                ema60_last = pd.Series(m_ema60).reindex(close_df.columns)
-            if m_ema120:
-                ema120_last = pd.Series(m_ema120).reindex(close_df.columns)
+                    pass
+            if m_ema5:
+                ema5_last = pd.Series(m_ema5).reindex(close_df.columns)
+            if m_ema10:
+                ema10_last = pd.Series(m_ema10).reindex(close_df.columns)
         except Exception:
-            print("Warning: failed to compute long-term EMAs for exclude_ema_downtrend filter")
+            print("Warning: failed to compute monthly EMAs for exclude_ema_downtrend filter")
             pass
         finally:
             if switched:
@@ -247,16 +234,16 @@ def filter_instruments_by_conditions(
         applied_masks.append(f"max_price<={max_price}")
         mask = _mask_le(mask, price_last, max_price)
 
-    # exclude long-term downtrend stocks (EMA120 > EMA60) if requested
+    # exclude long-term downtrend stocks (EMA5 <= EMA10) if requested
     if exclude_ema_downtrend:
         # only apply EMA filter if monthly EMAs are available; otherwise skip
-        if ema60_last.isna().all() and ema120_last.isna().all():
+        if ema5_last.isna().all() and ema10_last.isna().all():
             # no monthly EMA available, skip EMA filtering
             applied_masks.append("exclude_ema_downtrend requested but monthly EMAs missing (skipped)")
             print("Warning: exclude_ema_downtrend requested but monthly EMAs are all missing; skipping this filter")
         else:
-            applied_masks.append("exclude_ema_downtrend (EMA120<=EMA60)")
-            cond = ema120_last <= ema60_last
+            applied_masks.append("exclude_ema_downtrend (EMA5>EMA10)")
+            cond = ema5_last > ema10_last
             cond = cond.fillna(False)
             mask = mask & cond
 
@@ -284,8 +271,8 @@ def filter_instruments_by_conditions(
     metrics["amount"] = last_amount
     metrics["avg_amount"] = avg_amount
     metrics["price"] = price_last
-    metrics["ema60"] = ema60_last
-    metrics["ema120"] = ema120_last
+    metrics["ema5"] = ema5_last
+    metrics["ema10"] = ema10_last
     if turnover_median is not None:
         metrics["turnover"] = turnover_median
     info["metrics"] = metrics
