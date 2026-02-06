@@ -346,6 +346,10 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
             self._cached_month_df = self._normalize_indicator_df(self._get_indicator_df("month"))
         except Exception:
             self._cached_month_df = pd.DataFrame()
+        try:
+            self._cached_week_df = self._normalize_indicator_df(self._get_indicator_df("week"))
+        except Exception:
+            self._cached_week_df = pd.DataFrame()
         # take-profit/trailing-stop tracking
         self._tp_holdout: Set[str] = set()
         self._tp_high: Dict[str, float] = {}
@@ -410,6 +414,7 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
         # use cached normalized DataFrames initialized at construction
         df_all = self._cached_day_df if hasattr(self, "_cached_day_df") else self._normalize_indicator_df(self._get_indicator_df("day"))
         df_month = self._cached_month_df if hasattr(self, "_cached_month_df") else self._normalize_indicator_df(self._get_indicator_df("month"))
+        df_week = self._cached_week_df if hasattr(self, "_cached_week_df") else self._normalize_indicator_df(self._get_indicator_df("week"))
         if not instruments or df_all.empty:
             print("No instruments or indicator data available for MACD flag computation.")
             return {}
@@ -429,7 +434,6 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                 row = sub.iloc[-1]
                 prev_row = sub.iloc[-2] if len(sub) >= 2 else None
                 prev_row2 = sub.iloc[-3] if len(sub) >= 3 else None
-                prev_row3 = sub.iloc[-4] if len(sub) >= 4 else None
                 dif = float(row.get("$DIF")) if "$DIF" in row else None
                 dea = float(row.get("$DEA")) if "$DEA" in row else None
                 dif_prev = float(prev_row.get("$DIF")) if prev_row is not None and "$DIF" in prev_row else None
@@ -437,18 +441,10 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                 macd = float(row.get("$MACD")) if "$MACD" in row else None
                 macd_prev = float(prev_row.get("$MACD")) if prev_row is not None and "$MACD" in prev_row else None
                 macd_prev2 = float(prev_row2.get("$MACD")) if prev_row2 is not None and "$MACD" in prev_row2 else None
-                macd_prev3 = float(prev_row3.get("$MACD")) if prev_row3 is not None and "$MACD" in prev_row3 else None
-                rsi = float(row.get("$RSI")) if "$RSI" in row else None
-                kdj_k = float(row.get("$KDJ_K")) if "$KDJ_K" in row else None
-                kdj_d = float(row.get("$KDJ_D")) if "$KDJ_D" in row else None
                 mfi = float(row.get("$MFI")) if "$MFI" in row else None
-                kdj_k_prev = float(prev_row.get("$KDJ_K")) if prev_row is not None and "$KDJ_K" in prev_row else None
-                kdj_d_prev = float(prev_row.get("$KDJ_D")) if prev_row is not None and "$KDJ_D" in prev_row else None
-                ema10 = float(row.get("$EMA10")) if "$EMA10" in row else None
-                ema60 = float(row.get("$EMA60")) if "$EMA60" in row else None
-                ema120 = float(row.get("$EMA120")) if "$EMA120" in row else None
 
-                # monthly EMA alignment (EMA5 > EMA10 > EMA20) and MACD not two consecutive declines
+                # monthly EMA alignment (EMA5 > EMA10 > EMA20), MFI > MA(MFI,10),
+                # and MACD not two consecutive declines
                 monthly_ok = True
                 if not df_month.empty:
                     try:
@@ -463,6 +459,7 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                             ema10_m = float(row_m.get("$EMA10")) if "$EMA10" in row_m else None
                             ema20_m = float(row_m.get("$EMA20")) if "$EMA20" in row_m else None
                             macd_m = float(row_m.get("$MACD")) if "$MACD" in row_m else None
+                            mfi_m = float(row_m.get("$MFI")) if "$MFI" in row_m else None
                             macd_m_prev = (
                                 float(prev_row_m.get("$MACD"))
                                 if prev_row_m is not None and "$MACD" in prev_row_m
@@ -473,7 +470,26 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                                 if prev_row_m2 is not None and "$MACD" in prev_row_m2
                                 else None
                             )
-                            if ema5_m is None or ema10_m is None or ema20_m is None:
+                            # MFI > MA(MFI,10) using monthly series
+                            mfi_ok = False
+                            try:
+                                if "$MFI" in sub_m.columns:
+                                    if "$MFI_MA10" in sub_m.columns:
+                                        mfi_ma10 = row_m.get("$MFI_MA10")
+                                        if mfi_m is not None and not pd.isna(mfi_ma10):
+                                            mfi_ok = mfi_m > float(mfi_ma10)
+                                    else:
+                                        print(f"Warning: $MFI_MA10 not found in monthly data for {inst}. Skipping MFI check for monthly_ok.")
+                                        mfi_series = pd.to_numeric(sub_m["$MFI"], errors="coerce")
+                                        mfi_recent = mfi_series.tail(10)
+                                        if len(mfi_recent) >= 2:
+                                            mfi_ma10 = mfi_recent.mean()
+                                            if mfi_m is not None and not pd.isna(mfi_ma10):
+                                                mfi_ok = mfi_m > float(mfi_ma10)
+                            except Exception:
+                                mfi_ok = False
+
+                            if ema5_m is None or ema10_m is None or ema20_m is None or not mfi_ok:
                                 monthly_ok = False
                             else:
                                 monthly_ok = ema5_m > ema10_m > ema20_m
@@ -483,6 +499,30 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                         monthly_ok = False
                 else:
                     monthly_ok = False
+
+                weekly_ok = False
+                if not df_week.empty:
+                    try:
+                        sub_w = df_week.xs(inst, level="instrument")
+                        if isinstance(sub_w.index, pd.DatetimeIndex):
+                            sub_w = sub_w[sub_w.index <= end_ts]
+                        if not sub_w.empty and "$MFI" in sub_w.columns:
+                            row_w = sub_w.iloc[-1]
+                            mfi_w = float(row_w.get("$MFI")) if "$MFI" in row_w else None
+                            if "$MFI_MA10" in sub_w.columns:
+                                mfi_ma10 = row_w.get("$MFI_MA10")
+                                if mfi_w is not None and not pd.isna(mfi_ma10):
+                                    weekly_ok = mfi_w > float(mfi_ma10)
+                            else:
+                                print(f"Weekly MFI MA10 not found for {inst}, calculating from recent data...")
+                                mfi_series = pd.to_numeric(sub_w["$MFI"], errors="coerce")
+                                mfi_recent = mfi_series.tail(10)
+                                if len(mfi_recent) >= 2:
+                                    mfi_ma10 = mfi_recent.mean()
+                                    if mfi_w is not None and not pd.isna(mfi_ma10):
+                                        weekly_ok = mfi_w > float(mfi_ma10)
+                    except Exception:
+                        weekly_ok = False
 
                 vol_ok = False
                 try:
@@ -496,6 +536,24 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                             vol_ok = False
                 except Exception:
                     vol_ok = False
+
+                mfi_day_ok = False
+                try:
+                    if "$MFI" in sub.columns:
+                        if "$MFI_MA10" in sub.columns:
+                            mfi_ma10 = row.get("$MFI_MA10")
+                            if mfi is not None and not pd.isna(mfi_ma10):
+                                mfi_day_ok = mfi > float(mfi_ma10)
+                        else:
+                            print(f"Daily MFI MA10 not found for {inst}, calculating from recent data...")
+                            mfi_series = pd.to_numeric(sub["$MFI"], errors="coerce")
+                            mfi_recent = mfi_series[mfi_series.index <= end_ts].tail(10)
+                            if len(mfi_recent) >= 2:
+                                mfi_ma10 = mfi_recent.mean()
+                                if mfi is not None and not pd.isna(mfi_ma10):
+                                    mfi_day_ok = mfi > float(mfi_ma10)
+                except Exception:
+                    mfi_day_ok = False
             except Exception:
                 dif = dea = dif_prev = dea_prev = rsi = kdj_k = kdj_d = mfi = kdj_k_prev = kdj_d_prev = None
                 macd = macd_prev = macd_prev2 = macd_prev3 = None
@@ -509,12 +567,6 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                 and macd_prev2 is not None
                 and macd < macd_prev < macd_prev2
             )
-            ema_bear = (
-                ema10 is not None
-                and ema60 is not None
-                and ema120 is not None
-                and ema10 < ema60 < ema120
-            )
 
             macd_buy = (
                 dif > dea
@@ -522,40 +574,11 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                 and not macd_down_2
                 and vol_ok
                 and monthly_ok
-            )
-            kdj_buy = (
-                kdj_k is not None
-                and kdj_d is not None
-                and kdj_k_prev is not None
-                and kdj_k_prev <= self.kdj_oversold
-                and kdj_k > kdj_d
-            )
-            kdj_golden_buy = (
-                kdj_k is not None
-                and kdj_d is not None
-                and kdj_k_prev is not None
-                and kdj_d_prev is not None
-                and kdj_k_prev <= kdj_d_prev
-                and kdj_k > kdj_d
+                and mfi_day_ok
+                and weekly_ok
             )
 
             buy = macd_buy
-            macd_sell = dif_prev >= dea_prev and dif < dea and (rsi is not None and rsi >= self.rsi_overbought)
-            kdj_golden_sell = (
-                kdj_k is not None
-                and kdj_d is not None
-                and kdj_k_prev is not None
-                and kdj_d_prev is not None
-                and kdj_k_prev >= self.kdj_overbought
-                and kdj_k_prev >= kdj_d_prev
-                and kdj_k < kdj_d
-            )
-            mfi_sell = (
-                mfi is not None
-                and mfi >= self.mfi_overbought
-                and dif > 0
-                and dea > 0
-            )
             sell = []
             flags[inst] = {"buy": bool(buy), "sell": bool(sell)}
         return flags

@@ -465,9 +465,21 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days, liq
     except Exception:
         pass
 
-    # liquidity and listing filters
-    _liquidity_filter(hkmod, target_day, liq_threshold, liq_window, hkw)
-    _listing_filter(target_day, hkw, min_listing_days)
+    # Use precomputed instrument list from CSV (no liquidity/listing filters here)
+    try:
+        csv_path = os.path.abspath(os.path.join(os.getcwd(), "instrument_filtered.csv"))
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"instrument_filtered.csv not found at {csv_path}")
+        df = pd.read_csv(csv_path)
+        if df.empty:
+            raise RuntimeError(f"instrument_filtered.csv is empty at {csv_path}")
+        inst_col = "instrument" if "instrument" in df.columns else df.columns[0]
+        keep_insts = df[inst_col].astype(str).tolist()
+        hkw["instruments"] = keep_insts
+        print(f"Loaded instruments from CSV: {len(keep_insts)}")
+        print("Using precomputed CSV:", csv_path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load instrument_filtered.csv: {e}")
 
     # dataset/test segment
     ds_cfg.setdefault("kwargs", {})["segments"] = {"test": (target_day, target_day)}
