@@ -24,20 +24,22 @@ HK_BENCH = "800000.HK"  # ^HSI 被存成 800000.HK
 DAY_PROVIDER_URI = "~/.qlib/qlib_data/hk_data"
 MONTH_PROVIDER_URI = r"C:\Users\kennethlao\.qlib\qlib_data\hk_data_1mo"
 WEEK_PROVIDER_URI = "~/.qlib/qlib_data/hk_data_1w"
+YEAR_PROVIDER_URI = r"C:\Users\kennethlao\.qlib\qlib_data\hk_data_1y"
+
 
 
 def pre_cache_indicator_data(insts, start_time, end_time):
-    """Pre-cache day, weekly, and monthly indicators for the given instruments.
+    """Pre-cache day, weekly, monthly, and yearly indicators for the given instruments.
 
     Note:
     - Day data uses freq="day".
-    - Weekly and monthly data must NOT use freq.
-    - Provider is switched to weekly/monthly, then back to day.
+    - Weekly, monthly, and yearly data must NOT use freq.
+    - Provider is switched to weekly/monthly/yearly, then back to day.
     """
     print(f"Pre-caching indicator data for {len(insts)} instruments from {start_time} to {end_time}...")
     insts = list(dict.fromkeys(insts))
     if not insts:
-        return {"day": pd.DataFrame(), "month": pd.DataFrame(), "week": pd.DataFrame()}
+        return {"day": pd.DataFrame(), "month": pd.DataFrame(), "week": pd.DataFrame(), "year": pd.DataFrame()}
 
     def _add_mfi_ma10(df):
         if df is None or df.empty or "$MFI" not in df.columns:
@@ -57,15 +59,21 @@ def pre_cache_indicator_data(insts, start_time, end_time):
 
     # weekly (no freq)
     qlib.init(provider_uri=WEEK_PROVIDER_URI, region=REG_HK)
-    week_fields = ["$MFI"]
+    week_fields = ["$close", "$MFI"]
     week_df = D.features(insts, week_fields, start_time=start_time, end_time=end_time)
     week_df = _add_mfi_ma10(week_df)
 
     # monthly (no freq)
     qlib.init(provider_uri=MONTH_PROVIDER_URI, region=REG_HK)
-    month_fields = ["$EMA5", "$EMA10", "$EMA20", "$MACD", "$MFI", "$EMA60", "$EMA120"]
+    month_fields = ["$close", "$EMA5", "$EMA10", "$EMA20", "$MACD", "$MFI", "$EMA60", "$EMA120"]
     month_df = D.features(insts, month_fields, start_time=start_time, end_time=end_time)
     month_df = _add_mfi_ma10(month_df)
+
+    # yearly (no freq)
+    qlib.init(provider_uri=YEAR_PROVIDER_URI, region=REG_HK)
+    year_fields = ["$MFI"]
+    year_df = D.features(insts, year_fields, start_time=start_time, end_time=end_time)
+    year_df = _add_mfi_ma10(year_df)
 
     # day provider (freq="day")
     qlib.init(provider_uri=DAY_PROVIDER_URI, region=REG_HK)
@@ -84,7 +92,7 @@ def pre_cache_indicator_data(insts, start_time, end_time):
     ]
     day_df = D.features(insts, day_fields, start_time=start_time, end_time=end_time, freq="day", disk_cache=True)
     day_df = _add_mfi_ma10(day_df)
-    return {"day": day_df, "month": month_df, "week": week_df}
+    return {"day": day_df, "month": month_df, "week": week_df, "year": year_df}
 
 # 簡易的 HK Alpha158+LGB 配置（可以依需要調整）
 HK_GBDT_TASK = {

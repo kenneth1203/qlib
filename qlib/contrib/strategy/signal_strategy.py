@@ -350,6 +350,10 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
             self._cached_week_df = self._normalize_indicator_df(self._get_indicator_df("week"))
         except Exception:
             self._cached_week_df = pd.DataFrame()
+        try:
+            self._cached_year_df = self._normalize_indicator_df(self._get_indicator_df("year"))
+        except Exception:
+            self._cached_year_df = pd.DataFrame()
         # take-profit/trailing-stop tracking
         self._tp_holdout: Set[str] = set()
         self._tp_high: Dict[str, float] = {}
@@ -415,6 +419,7 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
         df_all = self._cached_day_df if hasattr(self, "_cached_day_df") else self._normalize_indicator_df(self._get_indicator_df("day"))
         df_month = self._cached_month_df if hasattr(self, "_cached_month_df") else self._normalize_indicator_df(self._get_indicator_df("month"))
         df_week = self._cached_week_df if hasattr(self, "_cached_week_df") else self._normalize_indicator_df(self._get_indicator_df("week"))
+        df_year = self._cached_year_df if hasattr(self, "_cached_year_df") else self._normalize_indicator_df(self._get_indicator_df("year"))
         if not instruments or df_all.empty:
             print("No instruments or indicator data available for MACD flag computation.")
             return {}
@@ -479,7 +484,6 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                                         if mfi_m is not None and not pd.isna(mfi_ma10):
                                             mfi_ok = mfi_m > float(mfi_ma10)
                                     else:
-                                        print(f"Warning: $MFI_MA10 not found in monthly data for {inst}. Skipping MFI check for monthly_ok.")
                                         mfi_series = pd.to_numeric(sub_m["$MFI"], errors="coerce")
                                         mfi_recent = mfi_series.tail(10)
                                         if len(mfi_recent) >= 2:
@@ -514,15 +518,51 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                                 if mfi_w is not None and not pd.isna(mfi_ma10):
                                     weekly_ok = mfi_w > float(mfi_ma10)
                             else:
-                                print(f"Weekly MFI MA10 not found for {inst}, calculating from recent data...")
                                 mfi_series = pd.to_numeric(sub_w["$MFI"], errors="coerce")
                                 mfi_recent = mfi_series.tail(10)
                                 if len(mfi_recent) >= 2:
                                     mfi_ma10 = mfi_recent.mean()
                                     if mfi_w is not None and not pd.isna(mfi_ma10):
                                         weekly_ok = mfi_w > float(mfi_ma10)
+
+                            if weekly_ok and "$close" in sub_w.columns:
+                                close_series = pd.to_numeric(sub_w["$close"], errors="coerce")
+                                close_recent = close_series.tail(10)
+                                mfi_recent = pd.to_numeric(sub_w["$MFI"], errors="coerce").tail(10)
+                                if not close_recent.empty and not mfi_recent.empty:
+                                    close_w = close_recent.iloc[-1]
+                                    mfi_w_recent = mfi_recent.iloc[-1]
+                                    if not pd.isna(close_w) and not pd.isna(mfi_w_recent):
+                                        close_high = close_w == close_recent.max()
+                                        if close_high:
+                                            mfi_high = mfi_w_recent == mfi_recent.max()
+                                            if not mfi_high:
+                                                weekly_ok = False
                     except Exception:
                         weekly_ok = False
+
+                yearly_ok = False
+                if not df_year.empty:
+                    try:
+                        sub_y = df_year.xs(inst, level="instrument")
+                        if isinstance(sub_y.index, pd.DatetimeIndex):
+                            sub_y = sub_y[sub_y.index <= end_ts]
+                        if not sub_y.empty and "$MFI" in sub_y.columns:
+                            row_y = sub_y.iloc[-1]
+                            mfi_y = float(row_y.get("$MFI")) if "$MFI" in row_y else None
+                            if "$MFI_MA10" in sub_y.columns:
+                                mfi_ma10 = row_y.get("$MFI_MA10")
+                                if mfi_y is not None and not pd.isna(mfi_ma10):
+                                    yearly_ok = mfi_y > float(mfi_ma10)
+                            else:
+                                mfi_series = pd.to_numeric(sub_y["$MFI"], errors="coerce")
+                                mfi_recent = mfi_series.tail(10)
+                                if len(mfi_recent) >= 2:
+                                    mfi_ma10 = mfi_recent.mean()
+                                    if mfi_y is not None and not pd.isna(mfi_ma10):
+                                        yearly_ok = mfi_y > float(mfi_ma10)
+                    except Exception:
+                        yearly_ok = False
 
                 vol_ok = False
                 try:
@@ -545,7 +585,6 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                             if mfi is not None and not pd.isna(mfi_ma10):
                                 mfi_day_ok = mfi > float(mfi_ma10)
                         else:
-                            print(f"Daily MFI MA10 not found for {inst}, calculating from recent data...")
                             mfi_series = pd.to_numeric(sub["$MFI"], errors="coerce")
                             mfi_recent = mfi_series[mfi_series.index <= end_ts].tail(10)
                             if len(mfi_recent) >= 2:
@@ -576,6 +615,7 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                 and monthly_ok
                 and mfi_day_ok
                 and weekly_ok
+                and yearly_ok
             )
 
             buy = macd_buy
@@ -695,6 +735,7 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
             bullish = {k for k in bullish if bool(turnover_mask.get(k, self.allow_missing_shares))}
 
         stop_loss_set: Set[str] = set()
+        month_df = self._cached_month_df if hasattr(self, "_cached_month_df") else self._normalize_indicator_df(self._get_indicator_df("month"))
         if self.stop_loss_pct is not None:
             for code in current_stock_list_all:
                 try:
@@ -714,7 +755,21 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                     cur_price = None
                 if cur_price is None:
                     continue
-                if cur_price <= buy_price * (1 - self.stop_loss_pct):
+                monthly_break = True
+                if month_df is not None and not month_df.empty:
+                    try:
+                        sub_m = month_df.xs(code, level="instrument")
+                        if isinstance(sub_m.index, pd.DatetimeIndex):
+                            sub_m = sub_m[sub_m.index <= pd.Timestamp(trade_start_time)]
+                        if not sub_m.empty:
+                            row_m = sub_m.iloc[-1]
+                            close_m = row_m.get("$close")
+                            ema10_m = row_m.get("$EMA10")
+                            if close_m is not None and ema10_m is not None and not pd.isna(close_m) and not pd.isna(ema10_m):
+                                monthly_break = float(close_m) < float(ema10_m)
+                    except Exception:
+                        monthly_break = True
+                if cur_price <= buy_price * (1 - self.stop_loss_pct) and monthly_break:
                     stop_loss_set.add(code)
 
         if not bullish and not stop_loss_set and not forced_sell_amounts:
