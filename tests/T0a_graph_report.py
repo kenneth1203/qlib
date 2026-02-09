@@ -561,9 +561,20 @@ if __name__ == "__main__":
         win_rate = (win_cnt / total_trades) if total_trades else 0.0
         avg_daily_trades = 0.0
         try:
-            if total_trades > 0 and "buy_time" in trade_df.columns:
-                buy_dates = pd.to_datetime(trade_df["buy_time"], errors="coerce").dt.normalize()
-                day_count = int(buy_dates.dropna().nunique())
+            if total_trades > 0:
+                # Use the number of trading days in the backtest period as denominator.
+                # Prefer `report_normal_df` (account / report time series) when available.
+                day_count = 0
+                if isinstance(report_normal_df, pd.DataFrame) and not report_normal_df.empty:
+                    try:
+                        day_count = int(pd.to_datetime(report_normal_df.index).normalize().nunique())
+                    except Exception:
+                        day_count = int(len(report_normal_df.index)) if len(report_normal_df.index) > 0 else 0
+                else:
+                    # Fallback: count unique buy dates from trade records
+                    if "buy_time" in trade_df.columns:
+                        buy_dates = pd.to_datetime(trade_df["buy_time"], errors="coerce").dt.normalize()
+                        day_count = int(buy_dates.dropna().nunique())
                 avg_daily_trades = (total_trades / day_count) if day_count > 0 else 0.0
         except Exception:
             avg_daily_trades = 0.0

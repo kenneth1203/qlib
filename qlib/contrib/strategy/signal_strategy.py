@@ -426,179 +426,114 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
         end_ts = pd.Timestamp(end_time)
         flags: Dict[str, Dict[str, bool]] = {}
 
+        def _get_sub(df, inst):
+            if df is None or df.empty:
+                return pd.DataFrame()
+            try:
+                sub_df = df.xs(inst, level="instrument")
+            except Exception:
+                return pd.DataFrame()
+            if isinstance(sub_df.index, pd.DatetimeIndex):
+                sub_df = sub_df[sub_df.index <= end_ts]
+            return sub_df
+
+        def _get_float(row, key):
+            if row is None or key not in row:
+                return None
+            val = row.get(key)
+            if val is None or pd.isna(val):
+                return None
+            try:
+                return float(val)
+            except Exception:
+                return None
+
+        def _mfi_gt_ma10(sub_df, row, mfi_val):
+            if sub_df.empty or "$MFI" not in sub_df.columns or mfi_val is None:
+                return False
+            if "$MFI_MA10" in sub_df.columns:
+                mfi_ma10 = row.get("$MFI_MA10")
+                if mfi_ma10 is None or pd.isna(mfi_ma10):
+                    return False
+                return mfi_val > float(mfi_ma10)
+            mfi_series = pd.to_numeric(sub_df["$MFI"], errors="coerce").tail(10)
+            if len(mfi_series) < 2:
+                return False
+            mfi_ma10 = mfi_series.mean()
+            if pd.isna(mfi_ma10):
+                return False
+            return mfi_val > float(mfi_ma10)
+
         for inst in instruments:
-            try:
-                sub = df_all.xs(inst, level="instrument")
-            except Exception:
+            sub = _get_sub(df_all, inst)
+            if sub.empty:
                 continue
-            try:
-                if isinstance(sub.index, pd.DatetimeIndex):
-                    sub = sub[sub.index <= end_ts]
-                if sub.empty:
-                    continue
-                row = sub.iloc[-1]
-                prev_row = sub.iloc[-2] if len(sub) >= 2 else None
-                prev_row2 = sub.iloc[-3] if len(sub) >= 3 else None
-                dif = float(row.get("$DIF")) if "$DIF" in row else None
-                dea = float(row.get("$DEA")) if "$DEA" in row else None
-                dif_prev = float(prev_row.get("$DIF")) if prev_row is not None and "$DIF" in prev_row else None
-                dea_prev = float(prev_row.get("$DEA")) if prev_row is not None and "$DEA" in prev_row else None
-                macd = float(row.get("$MACD")) if "$MACD" in row else None
-                macd_prev = float(prev_row.get("$MACD")) if prev_row is not None and "$MACD" in prev_row else None
-                macd_prev2 = float(prev_row2.get("$MACD")) if prev_row2 is not None and "$MACD" in prev_row2 else None
-                mfi = float(row.get("$MFI")) if "$MFI" in row else None
-
-                # monthly EMA alignment (EMA5 > EMA10 > EMA20), MFI > MA(MFI,10),
-                # and MACD not two consecutive declines
-                monthly_ok = True
-                if not df_month.empty:
-                    try:
-                        sub_m = df_month.xs(inst, level="instrument")
-                        if isinstance(sub_m.index, pd.DatetimeIndex):
-                            sub_m = sub_m[sub_m.index <= end_ts]
-                        if not sub_m.empty:
-                            row_m = sub_m.iloc[-1]
-                            prev_row_m = sub_m.iloc[-2] if len(sub_m) >= 2 else None
-                            prev_row_m2 = sub_m.iloc[-3] if len(sub_m) >= 3 else None
-                            ema5_m = float(row_m.get("$EMA5")) if "$EMA5" in row_m else None
-                            ema10_m = float(row_m.get("$EMA10")) if "$EMA10" in row_m else None
-                            ema20_m = float(row_m.get("$EMA20")) if "$EMA20" in row_m else None
-                            macd_m = float(row_m.get("$MACD")) if "$MACD" in row_m else None
-                            mfi_m = float(row_m.get("$MFI")) if "$MFI" in row_m else None
-                            macd_m_prev = (
-                                float(prev_row_m.get("$MACD"))
-                                if prev_row_m is not None and "$MACD" in prev_row_m
-                                else None
-                            )
-                            macd_m_prev2 = (
-                                float(prev_row_m2.get("$MACD"))
-                                if prev_row_m2 is not None and "$MACD" in prev_row_m2
-                                else None
-                            )
-                            # MFI > MA(MFI,10) using monthly series
-                            mfi_ok = False
-                            try:
-                                if "$MFI" in sub_m.columns:
-                                    if "$MFI_MA10" in sub_m.columns:
-                                        mfi_ma10 = row_m.get("$MFI_MA10")
-                                        if mfi_m is not None and not pd.isna(mfi_ma10):
-                                            mfi_ok = mfi_m > float(mfi_ma10)
-                                    else:
-                                        mfi_series = pd.to_numeric(sub_m["$MFI"], errors="coerce")
-                                        mfi_recent = mfi_series.tail(10)
-                                        if len(mfi_recent) >= 2:
-                                            mfi_ma10 = mfi_recent.mean()
-                                            if mfi_m is not None and not pd.isna(mfi_ma10):
-                                                mfi_ok = mfi_m > float(mfi_ma10)
-                            except Exception:
-                                mfi_ok = False
-
-                            if ema5_m is None or ema10_m is None or ema20_m is None or not mfi_ok:
-                                monthly_ok = False
-                            else:
-                                monthly_ok = ema5_m > ema10_m > ema20_m
-                            if monthly_ok and macd_m is not None and macd_m_prev is not None and macd_m_prev2 is not None:
-                                monthly_ok = not (macd_m < macd_m_prev < macd_m_prev2)
-                    except Exception:
-                        monthly_ok = False
-                else:
-                    monthly_ok = False
-
-                weekly_ok = False
-                if not df_week.empty:
-                    try:
-                        sub_w = df_week.xs(inst, level="instrument")
-                        if isinstance(sub_w.index, pd.DatetimeIndex):
-                            sub_w = sub_w[sub_w.index <= end_ts]
-                        if not sub_w.empty and "$MFI" in sub_w.columns:
-                            row_w = sub_w.iloc[-1]
-                            mfi_w = float(row_w.get("$MFI")) if "$MFI" in row_w else None
-                            if "$MFI_MA10" in sub_w.columns:
-                                mfi_ma10 = row_w.get("$MFI_MA10")
-                                if mfi_w is not None and not pd.isna(mfi_ma10):
-                                    weekly_ok = mfi_w > float(mfi_ma10)
-                            else:
-                                mfi_series = pd.to_numeric(sub_w["$MFI"], errors="coerce")
-                                mfi_recent = mfi_series.tail(10)
-                                if len(mfi_recent) >= 2:
-                                    mfi_ma10 = mfi_recent.mean()
-                                    if mfi_w is not None and not pd.isna(mfi_ma10):
-                                        weekly_ok = mfi_w > float(mfi_ma10)
-
-                            if weekly_ok and "$close" in sub_w.columns:
-                                close_series = pd.to_numeric(sub_w["$close"], errors="coerce")
-                                close_recent = close_series.tail(10)
-                                mfi_recent = pd.to_numeric(sub_w["$MFI"], errors="coerce").tail(10)
-                                if not close_recent.empty and not mfi_recent.empty:
-                                    close_w = close_recent.iloc[-1]
-                                    mfi_w_recent = mfi_recent.iloc[-1]
-                                    if not pd.isna(close_w) and not pd.isna(mfi_w_recent):
-                                        close_high = close_w == close_recent.max()
-                                        if close_high:
-                                            mfi_high = mfi_w_recent == mfi_recent.max()
-                                            if not mfi_high:
-                                                weekly_ok = False
-                    except Exception:
-                        weekly_ok = False
-
-                yearly_ok = False
-                if not df_year.empty:
-                    try:
-                        sub_y = df_year.xs(inst, level="instrument")
-                        if isinstance(sub_y.index, pd.DatetimeIndex):
-                            sub_y = sub_y[sub_y.index <= end_ts]
-                        if not sub_y.empty and "$MFI" in sub_y.columns:
-                            row_y = sub_y.iloc[-1]
-                            mfi_y = float(row_y.get("$MFI")) if "$MFI" in row_y else None
-                            if "$MFI_MA10" in sub_y.columns:
-                                mfi_ma10 = row_y.get("$MFI_MA10")
-                                if mfi_y is not None and not pd.isna(mfi_ma10):
-                                    yearly_ok = mfi_y > float(mfi_ma10)
-                            else:
-                                mfi_series = pd.to_numeric(sub_y["$MFI"], errors="coerce")
-                                mfi_recent = mfi_series.tail(10)
-                                if len(mfi_recent) >= 2:
-                                    mfi_ma10 = mfi_recent.mean()
-                                    if mfi_y is not None and not pd.isna(mfi_ma10):
-                                        yearly_ok = mfi_y > float(mfi_ma10)
-                    except Exception:
-                        yearly_ok = False
-
-                vol_ok = False
-                try:
-                    if "$volume" in sub.columns:
-                        vol_series = pd.to_numeric(sub["$volume"], errors="coerce")
-                        vol_recent = vol_series[vol_series.index <= end_ts].tail(10)
-                        if len(vol_recent) >= 9:
-                            good_days = (vol_recent.fillna(0) > 0).sum()
-                            vol_ok = int(good_days) >= 9
-                        else:
-                            vol_ok = False
-                except Exception:
-                    vol_ok = False
-
-                mfi_day_ok = False
-                try:
-                    if "$MFI" in sub.columns:
-                        if "$MFI_MA10" in sub.columns:
-                            mfi_ma10 = row.get("$MFI_MA10")
-                            if mfi is not None and not pd.isna(mfi_ma10):
-                                mfi_day_ok = mfi > float(mfi_ma10)
-                        else:
-                            mfi_series = pd.to_numeric(sub["$MFI"], errors="coerce")
-                            mfi_recent = mfi_series[mfi_series.index <= end_ts].tail(10)
-                            if len(mfi_recent) >= 2:
-                                mfi_ma10 = mfi_recent.mean()
-                                if mfi is not None and not pd.isna(mfi_ma10):
-                                    mfi_day_ok = mfi > float(mfi_ma10)
-                except Exception:
-                    mfi_day_ok = False
-            except Exception:
-                dif = dea = dif_prev = dea_prev = rsi = kdj_k = kdj_d = mfi = kdj_k_prev = kdj_d_prev = None
-                macd = macd_prev = macd_prev2 = macd_prev3 = None
-                ema10 = ema60 = ema120 = None
+            row = sub.iloc[-1]
+            prev_row = sub.iloc[-2] if len(sub) >= 2 else None
+            prev_row2 = sub.iloc[-3] if len(sub) >= 3 else None
+            dif = _get_float(row, "$DIF")
+            dea = _get_float(row, "$DEA")
+            dif_prev = _get_float(prev_row, "$DIF")
+            dea_prev = _get_float(prev_row, "$DEA")
+            macd = _get_float(row, "$MACD")
+            macd_prev = _get_float(prev_row, "$MACD")
+            macd_prev2 = _get_float(prev_row2, "$MACD")
+            mfi = _get_float(row, "$MFI")
             if None in (dif, dea, dif_prev, dea_prev):
                 continue
+
+            # monthly EMA alignment (EMA5 > EMA10 > EMA20), MFI > MA(MFI,10),
+            # and MACD not two consecutive declines
+            monthly_ok = False
+            sub_m = _get_sub(df_month, inst)
+            if not sub_m.empty:
+                row_m = sub_m.iloc[-1]
+                prev_row_m = sub_m.iloc[-2] if len(sub_m) >= 2 else None
+                prev_row_m2 = sub_m.iloc[-3] if len(sub_m) >= 3 else None
+                ema5_m = _get_float(row_m, "$EMA5")
+                ema10_m = _get_float(row_m, "$EMA10")
+                ema20_m = _get_float(row_m, "$EMA20")
+                macd_m = _get_float(row_m, "$MACD")
+                mfi_m = _get_float(row_m, "$MFI")
+                macd_m_prev = _get_float(prev_row_m, "$MACD")
+                macd_m_prev2 = _get_float(prev_row_m2, "$MACD")
+                mfi_ok = _mfi_gt_ma10(sub_m, row_m, mfi_m)
+                if ema5_m is not None and ema10_m is not None and ema20_m is not None and mfi_ok:
+                    monthly_ok = ema5_m > ema10_m > ema20_m
+                    if monthly_ok and macd_m is not None and macd_m_prev is not None and macd_m_prev2 is not None:
+                        monthly_ok = not (macd_m < macd_m_prev < macd_m_prev2)
+
+            weekly_ok = False
+            sub_w = _get_sub(df_week, inst)
+            if not sub_w.empty:
+                row_w = sub_w.iloc[-1]
+                mfi_w = _get_float(row_w, "$MFI")
+                weekly_ok = _mfi_gt_ma10(sub_w, row_w, mfi_w)
+                if weekly_ok and "$close" in sub_w.columns and "$MFI" in sub_w.columns:
+                    close_recent = pd.to_numeric(sub_w["$close"], errors="coerce").tail(10)
+                    mfi_recent = pd.to_numeric(sub_w["$MFI"], errors="coerce").tail(10)
+                    if not close_recent.empty and not mfi_recent.empty:
+                        close_w = close_recent.iloc[-1]
+                        mfi_w_recent = mfi_recent.iloc[-1]
+                        if not pd.isna(close_w) and not pd.isna(mfi_w_recent):
+                            if close_w == close_recent.max() and mfi_w_recent != mfi_recent.max():
+                                weekly_ok = False
+
+            yearly_ok = False
+            sub_y = _get_sub(df_year, inst)
+            if not sub_y.empty:
+                row_y = sub_y.iloc[-1]
+                mfi_y = _get_float(row_y, "$MFI")
+                yearly_ok = _mfi_gt_ma10(sub_y, row_y, mfi_y)
+
+            vol_ok = False
+            if "$volume" in sub.columns:
+                vol_series = pd.to_numeric(sub["$volume"], errors="coerce").tail(10)
+                if len(vol_series) >= 9:
+                    good_days = (vol_series.fillna(0) > 0).sum()
+                    vol_ok = int(good_days) >= 9
+
+            mfi_day_ok = _mfi_gt_ma10(sub, row, mfi)
 
             macd_down_2 = (
                 macd is not None
@@ -607,13 +542,30 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                 and macd < macd_prev < macd_prev2
             )
 
-            macd_buy = (
+            daily_peak_ok = True
+            if "$close" in sub.columns and "$MFI" in sub.columns:
+                close_series = pd.to_numeric(sub["$close"], errors="coerce").tail(10)
+                mfi_series = pd.to_numeric(sub["$MFI"], errors="coerce").tail(10)
+                if not close_series.empty and not mfi_series.empty:
+                    close_last = close_series.iloc[-1]
+                    mfi_last = mfi_series.iloc[-1]
+                    if not pd.isna(close_last) and not pd.isna(mfi_last):
+                        # if price makes a recent high but MFI does not, disallow
+                        if close_last == close_series.max() and mfi_last != mfi_series.max():
+                            daily_peak_ok = False
+
+            daily_ok = (
                 dif > dea
                 and dif > 0
                 and not macd_down_2
                 and vol_ok
-                and monthly_ok
                 and mfi_day_ok
+                and daily_peak_ok
+            )
+
+            macd_buy = (
+                daily_ok
+                and monthly_ok
                 and weekly_ok
                 and yearly_ok
             )

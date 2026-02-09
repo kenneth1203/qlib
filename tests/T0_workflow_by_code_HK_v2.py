@@ -78,6 +78,7 @@ def pre_cache_indicator_data(insts, start_time, end_time):
     # day provider (freq="day")
     qlib.init(provider_uri=DAY_PROVIDER_URI, region=REG_HK)
     day_fields = [
+        "$close",
         "$DIF",
         "$DEA",
         "$MACD",

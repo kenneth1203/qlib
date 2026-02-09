@@ -94,26 +94,12 @@ def _load_issued_shares(provider_uri: str) -> pd.Series:
         return pd.Series(dtype=float)
 
 
-def _get_turnover_mask(instruments, trade_date, provider_uri, min_turnover, allow_missing_shares):
+def _get_turnover_mask(instruments, trade_date, df_all, shares, min_turnover, allow_missing_shares):
     if not instruments:
         return pd.Series(dtype=bool)
-    shares = _load_issued_shares(provider_uri)
     if shares.empty:
         return pd.Series(allow_missing_shares, index=pd.Index(instruments, name="instrument"))
-    from qlib.data import D
-
     trade_ts = pd.Timestamp(trade_date)
-    start_dt = (trade_ts - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
-    try:
-        df_all = D.features(
-            instruments,
-            ["$volume"],
-            start_time=start_dt,
-            end_time=trade_date,
-            freq="day",
-        )
-    except Exception:
-        return pd.Series(allow_missing_shares, index=pd.Index(instruments, name="instrument"))
     if df_all is None or df_all.empty or "$volume" not in df_all.columns:
         return pd.Series(allow_missing_shares, index=pd.Index(instruments, name="instrument"))
     mask = pd.Series(False, index=pd.Index(instruments, name="instrument"))
@@ -145,11 +131,23 @@ def _get_turnover_mask(instruments, trade_date, provider_uri, min_turnover, allo
 def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120, notifier: Optional[TelegramNotifier] = None):
     provider_uri = os.path.expanduser(provider_uri)
     month_provider_uri = os.path.expanduser("~/.qlib/qlib_data/hk_data_1mo")
-    qlib.init(provider_uri=provider_uri, region=REG_HK)
+    week_provider_uri = os.path.expanduser("~/.qlib/qlib_data/hk_data_1w")
+    year_provider_uri = os.path.expanduser("~/.qlib/qlib_data/hk_data_1y")
+
+    active_provider = None
+
+    def _ensure_provider(uri: str):
+        nonlocal active_provider
+        if active_provider != uri:
+            qlib.init(provider_uri=uri, region=REG_HK)
+            active_provider = uri
+
+    _ensure_provider(provider_uri)
 
     # MACD buy + turnover filter settings (aligned with MACDTopkDropoutStrategy_v2 defaults)
     min_turnover = 0.001
     allow_missing_shares = False
+    shares = _load_issued_shares(provider_uri)
 
     # import the HK example dataset config
     try:
@@ -249,12 +247,13 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                 try:
                     #import pandas as pd
 
+                    _ensure_provider(provider_uri)
+
                     listing_df = D.features(
                         insts,
                         ["$close"],
                         start_time="2005-01-01",
                         end_time=target_day,
-                        freq="day",
                         disk_cache=True,
                     )
                     listed_days_map = {}
@@ -379,7 +378,8 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                         ss = ss.groupby(level=inst_level).last()
                     except Exception:
                         ss = ss.droplevel([n for i, n in enumerate(ss.index.names) if i != inst_level])
-            top = ss.sort_values(ascending=False).head(max(topk, 500))
+            # keep full ranked list (do not cap at 500); selection later truncates to `topk`
+            top = ss.sort_values(ascending=False)
 
             # --- Select top-k (liquidity + listing pre-filters already applied via handler) ---
             cand_insts = [to_qlib_inst(i) for i in top.index]
@@ -389,27 +389,87 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
             golden_set = set()
 
             try:
+                feat = None
+                week_feat = None
+                month_feat = None
+                year_feat = None
                 if cand_insts:
                     start_dt = (pd.to_datetime(target_day) - pd.Timedelta(days=240)).strftime("%Y-%m-%d")
+                    week_start_dt = (pd.to_datetime(target_day) - pd.Timedelta(days=400)).strftime("%Y-%m-%d")
+                    month_start_dt = (pd.to_datetime(target_day) - pd.Timedelta(days=900)).strftime("%Y-%m-%d")
+                    year_start_dt = (pd.to_datetime(target_day) - pd.Timedelta(days=365 * 15)).strftime("%Y-%m-%d")
+
+                    _ensure_provider(provider_uri)
                     feat = D.features(
                         cand_insts,
-                        ["$DIF", "$DEA", "$MACD", "$volume"],
+                        ["$DIF", "$DEA", "$MACD", "$volume", "$close", "$MFI"],
                         start_time=start_dt,
                         end_time=target_day,
-                        freq="day",
                     )
-                    month_start_dt = (pd.to_datetime(target_day) - pd.Timedelta(days=900)).strftime("%Y-%m-%d")
-                    qlib.init(provider_uri=month_provider_uri, region=REG_HK)
-                    try:
-                        month_feat = D.features(
-                            cand_insts,
-                            ["$EMA5", "$EMA10", "$EMA20", "$MACD", "$MFI"],
-                            start_time=month_start_dt,
-                            end_time=target_day,
-                        )
-                    finally:
-                        qlib.init(provider_uri=provider_uri, region=REG_HK)
+
+                    _ensure_provider(week_provider_uri)
+                    week_feat = D.features(
+                        cand_insts,
+                        ["$MFI", "$close"],
+                        start_time=week_start_dt,
+                        end_time=target_day,
+                    )
+
+                    _ensure_provider(month_provider_uri)
+                    month_feat = D.features(
+                        cand_insts,
+                        ["$EMA5", "$EMA10", "$EMA20", "$MACD", "$MFI"],
+                        start_time=month_start_dt,
+                        end_time=target_day,
+                    )
+
+                    _ensure_provider(year_provider_uri)
+                    year_feat = D.features(
+                        cand_insts,
+                        ["$MFI"],
+                        start_time=year_start_dt,
+                        end_time=target_day,
+                    )
+
+                    _ensure_provider(provider_uri)
                     if isinstance(feat, pd.DataFrame) and not feat.empty and isinstance(feat.index, pd.MultiIndex):
+                        def _get_sub(df, inst):
+                            if df is None or df.empty:
+                                return pd.DataFrame()
+                            try:
+                                sub_df = df.xs(inst, level="instrument")
+                            except Exception:
+                                return pd.DataFrame()
+                            sub_df = sub_df[sub_df.index <= pd.Timestamp(target_day)]
+                            return sub_df.sort_index()
+
+                        def _get_float(row, key):
+                            if row is None or key not in row:
+                                return None
+                            val = row.get(key)
+                            if val is None or pd.isna(val):
+                                return None
+                            try:
+                                return float(val)
+                            except Exception:
+                                return None
+
+                        def _mfi_gt_ma10(sub_df, row, mfi_val):
+                            if sub_df.empty or "$MFI" not in sub_df.columns or mfi_val is None:
+                                return False
+                            if "$MFI_MA10" in sub_df.columns:
+                                mfi_ma10 = row.get("$MFI_MA10")
+                                if mfi_ma10 is None or pd.isna(mfi_ma10):
+                                    return False
+                                return mfi_val > float(mfi_ma10)
+                            mfi_series = pd.to_numeric(sub_df["$MFI"], errors="coerce").tail(10)
+                            if len(mfi_series) < 2:
+                                return False
+                            mfi_ma10 = mfi_series.mean()
+                            if pd.isna(mfi_ma10):
+                                return False
+                            return mfi_val > float(mfi_ma10)
+
                         for inst, sub in feat.groupby(level=0):
                             sub_inst = sub.droplevel(0).sort_index()
                             if sub_inst.empty:
@@ -418,14 +478,12 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                             prev_row = sub_inst.iloc[-2] if len(sub_inst) >= 2 else None
                             prev_row2 = sub_inst.iloc[-3] if len(sub_inst) >= 3 else None
 
-                            try:
-                                dif = float(row.get("$DIF")) if "$DIF" in row else None
-                                dea = float(row.get("$DEA")) if "$DEA" in row else None
-                                macd = float(row.get("$MACD")) if "$MACD" in row else None
-                                macd_prev = float(prev_row.get("$MACD")) if prev_row is not None and "$MACD" in prev_row else None
-                                macd_prev2 = float(prev_row2.get("$MACD")) if prev_row2 is not None and "$MACD" in prev_row2 else None
-                            except Exception:
-                                dif = dea = macd = macd_prev = macd_prev2 = None
+                            dif = _get_float(row, "$DIF")
+                            dea = _get_float(row, "$DEA")
+                            macd = _get_float(row, "$MACD")
+                            macd_prev = _get_float(prev_row, "$MACD")
+                            macd_prev2 = _get_float(prev_row2, "$MACD")
+                            mfi = _get_float(row, "$MFI")
 
                             macd_down_2 = (
                                 macd is not None
@@ -435,65 +493,79 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                             )
 
                             monthly_ok = False
-                            try:
-                                if isinstance(month_feat, pd.DataFrame) and not month_feat.empty:
-                                    sub_m = month_feat.xs(inst, level="instrument")
-                                    sub_m = sub_m[sub_m.index <= pd.Timestamp(target_day)]
-                                    if not sub_m.empty:
-                                        row_m = sub_m.iloc[-1]
-                                        prev_row_m = sub_m.iloc[-2] if len(sub_m) >= 2 else None
-                                        prev_row_m2 = sub_m.iloc[-3] if len(sub_m) >= 3 else None
-                                        ema5_m = float(row_m.get("$EMA5")) if "$EMA5" in row_m else None
-                                        ema10_m = float(row_m.get("$EMA10")) if "$EMA10" in row_m else None
-                                        ema20_m = float(row_m.get("$EMA20")) if "$EMA20" in row_m else None
-                                        macd_m = float(row_m.get("$MACD")) if "$MACD" in row_m else None
-                                        mfi_m = float(row_m.get("$MFI")) if "$MFI" in row_m else None
-                                        macd_m_prev = (
-                                            float(prev_row_m.get("$MACD"))
-                                            if prev_row_m is not None and "$MACD" in prev_row_m
-                                            else None
-                                        )
-                                        macd_m_prev2 = (
-                                            float(prev_row_m2.get("$MACD"))
-                                            if prev_row_m2 is not None and "$MACD" in prev_row_m2
-                                            else None
-                                        )
-                                        mfi_ok = False
-                                        if "$MFI" in sub_m.columns:
-                                            mfi_series = pd.to_numeric(sub_m["$MFI"], errors="coerce")
-                                            mfi_recent = mfi_series.tail(10)
-                                            if len(mfi_recent) >= 2:
-                                                mfi_ma10 = mfi_recent.mean()
-                                                if mfi_m is not None and not pd.isna(mfi_ma10):
-                                                    mfi_ok = mfi_m > float(mfi_ma10)
+                            sub_m = _get_sub(month_feat, inst)
+                            if not sub_m.empty:
+                                row_m = sub_m.iloc[-1]
+                                prev_row_m = sub_m.iloc[-2] if len(sub_m) >= 2 else None
+                                prev_row_m2 = sub_m.iloc[-3] if len(sub_m) >= 3 else None
+                                ema5_m = _get_float(row_m, "$EMA5")
+                                ema10_m = _get_float(row_m, "$EMA10")
+                                ema20_m = _get_float(row_m, "$EMA20")
+                                macd_m = _get_float(row_m, "$MACD")
+                                mfi_m = _get_float(row_m, "$MFI")
+                                macd_m_prev = _get_float(prev_row_m, "$MACD")
+                                macd_m_prev2 = _get_float(prev_row_m2, "$MACD")
+                                mfi_ok = _mfi_gt_ma10(sub_m, row_m, mfi_m)
+                                if ema5_m is not None and ema10_m is not None and ema20_m is not None and mfi_ok:
+                                    monthly_ok = ema5_m > ema10_m > ema20_m
+                                    if macd_m is not None and macd_m_prev is not None and macd_m_prev2 is not None:
+                                        monthly_ok = not (macd_m < macd_m_prev < macd_m_prev2)
 
-                                        if ema5_m is not None and ema10_m is not None and ema20_m is not None and mfi_ok:
-                                            monthly_ok = ema5_m > ema10_m > ema20_m
-                                        if monthly_ok and macd_m is not None and macd_m_prev is not None and macd_m_prev2 is not None:
-                                            monthly_ok = not (macd_m < macd_m_prev < macd_m_prev2)
-                            except Exception:
-                                monthly_ok = False
+                            weekly_ok = False
+                            sub_w = _get_sub(week_feat, inst)
+                            if not sub_w.empty:
+                                row_w = sub_w.iloc[-1]
+                                mfi_w = _get_float(row_w, "$MFI")
+                                weekly_ok = _mfi_gt_ma10(sub_w, row_w, mfi_w)
+                                if weekly_ok and "$close" in sub_w.columns and "$MFI" in sub_w.columns:
+                                    close_recent = pd.to_numeric(sub_w["$close"], errors="coerce").tail(10)
+                                    mfi_recent = pd.to_numeric(sub_w["$MFI"], errors="coerce").tail(10)
+                                    if not close_recent.empty and not mfi_recent.empty:
+                                        close_w = close_recent.iloc[-1]
+                                        mfi_w_recent = mfi_recent.iloc[-1]
+                                        if not pd.isna(close_w) and not pd.isna(mfi_w_recent):
+                                            if close_w == close_recent.max() and mfi_w_recent != mfi_recent.max():
+                                                weekly_ok = False
+
+                            yearly_ok = False
+                            sub_y = _get_sub(year_feat, inst)
+                            if not sub_y.empty:
+                                row_y = sub_y.iloc[-1]
+                                mfi_y = _get_float(row_y, "$MFI")
+                                yearly_ok = _mfi_gt_ma10(sub_y, row_y, mfi_y)
 
                             vol_ok = False
-                            try:
-                                if "$volume" in sub_inst.columns:
-                                    vol_series = pd.to_numeric(sub_inst["$volume"], errors="coerce")
-                                    vol_recent = vol_series[vol_series.index <= pd.Timestamp(target_day)].tail(10)
-                                    if len(vol_recent) >= 9:
-                                        good_days = (vol_recent.fillna(0) > 0).sum()
-                                        vol_ok = int(good_days) >= 9
-                            except Exception:
-                                vol_ok = False
+                            if "$volume" in sub_inst.columns:
+                                vol_series = pd.to_numeric(sub_inst["$volume"], errors="coerce").tail(10)
+                                if len(vol_series) >= 9:
+                                    good_days = (vol_series.fillna(0) > 0).sum()
+                                    vol_ok = int(good_days) >= 9
 
-                            macd_buy = (
+                            mfi_day_ok = _mfi_gt_ma10(sub_inst, row, mfi)
+
+                            daily_peak_ok = True
+                            if "$close" in sub_inst.columns and "$MFI" in sub_inst.columns:
+                                close_series = pd.to_numeric(sub_inst["$close"], errors="coerce").tail(10)
+                                mfi_series = pd.to_numeric(sub_inst["$MFI"], errors="coerce").tail(10)
+                                if not close_series.empty and not mfi_series.empty:
+                                    close_last = close_series.iloc[-1]
+                                    mfi_last = mfi_series.iloc[-1]
+                                    if not pd.isna(close_last) and not pd.isna(mfi_last):
+                                        if close_last == close_series.max() and mfi_last != mfi_series.max():
+                                            daily_peak_ok = False
+
+                            daily_ok = (
                                 dif is not None
                                 and dea is not None
                                 and dif > dea
                                 and dif > 0
                                 and not macd_down_2
                                 and vol_ok
-                                and monthly_ok
+                                and mfi_day_ok
+                                and daily_peak_ok
                             )
+
+                            macd_buy = daily_ok and monthly_ok and weekly_ok and yearly_ok
 
                             if macd_buy:
                                 bullish_set.add(inst)
@@ -505,7 +577,8 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                 turnover_mask = _get_turnover_mask(
                     list(bullish_set),
                     target_day,
-                    provider_uri,
+                    feat,
+                    shares,
                     min_turnover,
                     allow_missing_shares,
                 )
@@ -527,12 +600,19 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
             # compute avg dollar volume over last `liq_window` trading bars for selected instruments
             try:
                 if selected:
-                    start_dt = (pd.to_datetime(target_day) - pd.Timedelta(days=liq_window * 3)).strftime("%Y-%m-%d")
-                    base = D.features(selected, ["$close", "$volume"], start_time=start_dt, end_time=target_day, freq="day")
-                    base.columns = ["$close", "$volume"]
+                    # Reuse cached day features when available to avoid extra data fetch.
+                    if feat is not None and isinstance(feat, pd.DataFrame) and not feat.empty:
+                        base = feat.loc[feat.index.get_level_values("instrument").isin(selected), ["$close", "$volume"]]
+                        base = base.rename(columns={"$close": "$close", "$volume": "$volume"})
+                    else:
+                        start_dt = (pd.to_datetime(target_day) - pd.Timedelta(days=liq_window * 3)).strftime("%Y-%m-%d")
+                        _ensure_provider(provider_uri)
+                        base = D.features(selected, ["$close", "$volume"], start_time=start_dt, end_time=target_day)
+                        base.columns = ["$close", "$volume"]
 
                     # Use 20-day median dollar volume (turnover) instead of long-window mean
                     turnover_window = 20
+
                     def _tail_median_dollar(df):
                         df2 = df.dropna()
                         if df2.empty:
@@ -540,9 +620,7 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                         dv = (df2["$close"] * df2["$volume"]).tail(turnover_window)
                         return float(dv.median()) if len(dv) > 0 else 0.0
 
-                    vol_map = (
-                        base.groupby(level="instrument").apply(_tail_median_dollar).to_dict()
-                    )
+                    vol_map = base.groupby(level="instrument").apply(_tail_median_dollar).to_dict()
             except Exception:
                 vol_map = {}
 
