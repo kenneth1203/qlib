@@ -467,7 +467,7 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days, liq
 
     # Use precomputed instrument list from CSV (no liquidity/listing filters here)
     try:
-        csv_path = os.path.abspath(os.path.join(os.getcwd(), "instrument_filtered.csv"))
+        csv_path = os.path.abspath(os.path.join(os.getcwd(), "instrument_filtered_bt.csv"))
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"instrument_filtered.csv not found at {csv_path}")
         df = pd.read_csv(csv_path)

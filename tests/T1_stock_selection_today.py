@@ -200,7 +200,7 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
             pass
         liq_window = 60
         try:
-            csv_path = os.path.abspath(os.path.join(os.getcwd(), "instrument_filtered.csv"))
+            csv_path = os.path.abspath(os.path.join(os.getcwd(), "instrument_filtered_bt.csv"))
             if not os.path.exists(csv_path):
                 raise FileNotFoundError(f"instrument_filtered.csv not found at {csv_path}")
 
@@ -384,6 +384,31 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
             # --- Select top-k (liquidity + listing pre-filters already applied via handler) ---
             cand_insts = [to_qlib_inst(i) for i in top.index]
             print(f"Total candidate instruments after pre-filters: {len(cand_insts)}")
+
+            # apply turnover filter for candidates
+            try:
+                if cand_insts:
+                    start_dt = (pd.to_datetime(target_day) - pd.Timedelta(days=liq_window * 3)).strftime("%Y-%m-%d")
+                    _ensure_provider(provider_uri)
+                    feat_turnover = D.features(
+                        cand_insts,
+                        ["$volume"],
+                        start_time=start_dt,
+                        end_time=target_day,
+                    )
+                    turnover_mask = _get_turnover_mask(
+                        cand_insts,
+                        target_day,
+                        feat_turnover,
+                        shares,
+                        min_turnover,
+                        allow_missing_shares,
+                    )
+                    cand_insts = [i for i in cand_insts if bool(turnover_mask.get(i, allow_missing_shares))]
+                    print(f"Candidates after turnover filter: {len(cand_insts)}")
+            except Exception as e:
+                print(f"Turnover filter skipped due to error: {e}")
+            """
             # apply multi-condition trend filter
             bullish_set = set()
             golden_set = set()
@@ -589,14 +614,17 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
             bullish_ranked = [i for i in cand_insts if i in bullish_set and i not in golden_set]
             print("sample of golden cross instruments:", golden_ranked[:5], "sample of bullish instruments:", bullish_ranked[:5])
             selected = (golden_ranked + bullish_ranked)[:topk]
-
+            """
+            selected = cand_insts[:topk]
             mapping = load_chinese_name_map()
 
             # Print selected top instruments with Chinese names and last-day volume
             score_df = top.reindex(cand_insts).to_frame("score")
             score_df.index.name = "instrument"
 
+            feat = None
             vol_map = {}
+            turnover_map = {}
             # compute avg dollar volume over last `liq_window` trading bars for selected instruments
             try:
                 if selected:
@@ -620,9 +648,27 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                         dv = (df2["$close"] * df2["$volume"]).tail(turnover_window)
                         return float(dv.median()) if len(dv) > 0 else 0.0
 
-                    vol_map = base.groupby(level="instrument").apply(_tail_median_dollar).to_dict()
+                    def _tail_median_volume(df):
+                        df2 = df.dropna()
+                        if df2.empty:
+                            return 0.0
+                        vv = df2["$volume"].tail(turnover_window)
+                        return float(vv.median()) if len(vv) > 0 else 0.0
+
+                    grouped = base.groupby(level="instrument")
+                    vol_map = grouped.apply(_tail_median_dollar).to_dict()
+                    vol_med = grouped.apply(_tail_median_volume).to_dict()
+                    for inst, med_vol in vol_med.items():
+                        try:
+                            share = shares.get(inst)
+                            if share is None or pd.isna(share) or float(share) == 0.0:
+                                continue
+                            turnover_map[inst] = float(med_vol) / float(share)
+                        except Exception:
+                            continue
             except Exception:
                 vol_map = {}
+                turnover_map = {}
 
             # Build a tidy view and print as an aligned table
             rows = []
@@ -631,24 +677,34 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                 mk = inst.split(".", 1)[0].zfill(5) + ".hk"
                 name = resolve_chinese(inst, mapping)
                 avg_dollar = int(round(vol_map.get(inst, 0)))
-                rows.append({"id": mk, "name": name, "score": score, "avg_dollar": avg_dollar})
+                turnover = turnover_map.get(inst)
+                rows.append(
+                    {"id": mk, "name": name, "score": score, "avg_dollar": avg_dollar, "turnover": turnover}
+                )
 
             view_df = pd.DataFrame(rows)
             if not view_df.empty:
                 # prepare formatted string columns for aligned printing
                 view_df["_score_s"] = view_df["score"].map(lambda x: f"{x:.6f}")
                 view_df["_avg_s"] = view_df["avg_dollar"].map(lambda x: f"{int(x):,}")
+                view_df["_turn_s"] = view_df["turnover"].map(
+                    lambda x: f"{x * 100:.2f}%" if pd.notna(x) else ""
+                )
                 # determine column widths (display width-aware)
-                cols = ["id", "name", "_score_s", "_avg_s"]
+                cols = ["id", "name", "_score_s", "_avg_s", "_turn_s"]
                 widths = {}
                 for c in cols:
-                    header_name = "score" if c == "_score_s" else ("avg_dollar" if c == "_avg_s" else c)
+                    header_name = "score" if c == "_score_s" else ("avg_dollar" if c == "_avg_s" else ("turnover" if c == "_turn_s" else c))
                     max_cell = 0
                     if not view_df.empty:
                         max_cell = int(view_df[c].map(lambda v: _disp_width(v)).max())
                     widths[c] = max(_disp_width(header_name), max_cell)
                 # header (use display-aware padding)
-                hdr = f"{_pad_right('id', widths['id'])}  {_pad_right('name', widths['name'])}  {_pad_left('score', widths['_score_s'])}  {_pad_left('avg_dollar', widths['_avg_s'])}"
+                hdr = (
+                    f"{_pad_right('id', widths['id'])}  {_pad_right('name', widths['name'])}  "
+                    f"{_pad_left('score', widths['_score_s'])}  {_pad_left('avg_dollar', widths['_avg_s'])}  "
+                    f"{_pad_left('turnover', widths['_turn_s'])}"
+                )
                 print(f"\nTop {topk} instruments for {target_day}:")
                 print(hdr)
                 # rows (display-aware padding)
@@ -658,7 +714,12 @@ def main(recorder_id, experiment_name, provider_uri, topk, min_listing_days=120,
                     name_s = r['name'] if pd.notna(r['name']) else ''
                     score_s = r['_score_s'] if pd.notna(r['_score_s']) else ''
                     avg_s = r['_avg_s'] if pd.notna(r['_avg_s']) else ''
-                    row_s = f"{_pad_right(id_s, widths['id'])}  {_pad_right(name_s, widths['name'])}  {_pad_left(score_s, widths['_score_s'])}  {_pad_left(avg_s, widths['_avg_s'])}"
+                    turn_s = r['_turn_s'] if pd.notna(r['_turn_s']) else ''
+                    row_s = (
+                        f"{_pad_right(id_s, widths['id'])}  {_pad_right(name_s, widths['name'])}  "
+                        f"{_pad_left(score_s, widths['_score_s'])}  {_pad_left(avg_s, widths['_avg_s'])}  "
+                        f"{_pad_left(turn_s, widths['_turn_s'])}"
+                    )
                     print(row_s)
                     lines.append(row_s)
     except Exception:

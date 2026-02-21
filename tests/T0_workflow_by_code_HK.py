@@ -175,13 +175,13 @@ if __name__ == "__main__":
     # --- Liquidity filter: read precomputed CSV; fallback to legacy ---
     handler_kwargs = HK_GBDT_TASK["dataset"]["kwargs"]["handler"]["kwargs"]
     try:
-        csv_path = os.path.abspath(os.path.join(os.getcwd(), "instrument_filtered.csv"))
+        csv_path = os.path.abspath(os.path.join(os.getcwd(), "instrument_filtered_bt.csv"))
         if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"instrument_filtered.csv not found at {csv_path}")
+            raise FileNotFoundError(f"instrument_filtered_bt.csv not found at {csv_path}")
 
         df = pd.read_csv(csv_path)
         if df.empty:
-            raise RuntimeError(f"instrument_filtered.csv is empty at {csv_path}")
+            raise RuntimeError(f"instrument_filtered_bt.csv is empty at {csv_path}")
 
         inst_col = "instrument" if "instrument" in df.columns else df.columns[0]
         keep_insts = df[inst_col].astype(str).tolist()
@@ -272,8 +272,8 @@ if __name__ == "__main__":
             "module_path": "qlib.contrib.strategy.signal_strategy",
             "kwargs": {
                 "signal": (model, dataset),
-                "topk": 12,
-                "n_drop": 2,
+                "topk": 6,
+                "n_drop": 1,
                 "only_tradable": True,
                 "forbid_all_trade_at_limit": True
             },
@@ -281,7 +281,7 @@ if __name__ == "__main__":
         "backtest": {
             "start_time": "2021-01-01",   # ✅ 與 test 對齊
             "end_time":   "2025-12-17",   # ✅ 與 test 對齊
-            "account": 10000000,
+            "account": 1000000,
             "benchmark": HK_BENCH,
             "exchange_kwargs": {
                 "freq": "day",
@@ -290,7 +290,7 @@ if __name__ == "__main__":
                 "close_cost": 0.0015,
                 "min_cost": 5,
                 "volume_threshold": {
-                    # limit per-step traded volume to 10% of daily volume
+                    # limit per-step traded volume to 20% of daily volume
                     "all": ("current", "0.2 * $volume")
                 },
                 # Inject per-instrument board-lot via factor if available
@@ -308,8 +308,27 @@ if __name__ == "__main__":
 
         # NOTE: This line is optional
     # It demonstrates that the dataset can be used standalone.
+    import pandas as _pd
+
     example_df = dataset.prepare("train")
     print(example_df.head())
+    # 只印出第一支股票的前 5 天，並完整列出所有因子
+    try:
+        insts = example_df.index.get_level_values("instrument").unique()
+        if len(insts) == 0:
+            print("dataset.prepare('train') returned no instruments")
+        else:
+            inst0 = insts[0]
+            inst_df = example_df.xs(inst0, level="instrument").head(5)
+            print(f"Instrument: {inst0}")
+            for dt, row in inst_df.iterrows():
+                print(f"\nDate: {dt}")
+                for name, value in row.items():
+                    print(f"{name} {value}")
+    except Exception as _e:
+        # 回退到原本的簡單輸出，避免因 inspect 失敗中斷流程
+        print("Failed to slice by instrument, falling back to head():", _e)
+        print(example_df.head())
 
     # start exp
     with R.start(experiment_name="workflow"):

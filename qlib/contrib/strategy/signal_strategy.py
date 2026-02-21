@@ -320,6 +320,7 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
         trailing_stop_drawdown: float = 0.20,
         min_turnover: float = 0.001,
         allow_missing_shares: bool = False,
+        allow_missing_periods: bool = True,
         indicator_data: Optional[Dict[str, pd.DataFrame]] = None,
         **kwargs,
     ):
@@ -336,6 +337,7 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
         self.trailing_stop_drawdown = trailing_stop_drawdown
         self.min_turnover = min_turnover
         self.allow_missing_shares = allow_missing_shares
+        self.allow_missing_periods = allow_missing_periods
         self.indicator_data = indicator_data or {}
         # Cache normalized indicator DataFrames once at initialization
         try:
@@ -426,7 +428,7 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
         end_ts = pd.Timestamp(end_time)
         flags: Dict[str, Dict[str, bool]] = {}
 
-        def _get_sub(df, inst):
+        def _get_sub(df, inst, period=None):
             if df is None or df.empty:
                 return pd.DataFrame()
             try:
@@ -435,6 +437,20 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                 return pd.DataFrame()
             if isinstance(sub_df.index, pd.DatetimeIndex):
                 sub_df = sub_df[sub_df.index <= end_ts]
+                if not sub_df.empty and period in ("week", "month", "year"):
+                    # Prevent lookahead: drop the current, not-yet-closed period if present.
+                    last_idx = sub_df.index[-1]
+                    try:
+                        if period == "week":
+                            same_period = last_idx.to_period("W") == end_ts.to_period("W")
+                        elif period == "month":
+                            same_period = last_idx.to_period("M") == end_ts.to_period("M")
+                        else:
+                            same_period = last_idx.to_period("Y") == end_ts.to_period("Y")
+                        if same_period:
+                            sub_df = sub_df.iloc[:-1]
+                    except Exception:
+                        pass
             return sub_df
 
         def _get_float(row, key):
@@ -481,11 +497,11 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
             mfi = _get_float(row, "$MFI")
             if None in (dif, dea, dif_prev, dea_prev):
                 continue
-
+            """
             # monthly EMA alignment (EMA5 > EMA10 > EMA20), MFI > MA(MFI,10),
             # and MACD not two consecutive declines
             monthly_ok = False
-            sub_m = _get_sub(df_month, inst)
+            sub_m = _get_sub(df_month, inst, period="month")
             if not sub_m.empty:
                 row_m = sub_m.iloc[-1]
                 prev_row_m = sub_m.iloc[-2] if len(sub_m) >= 2 else None
@@ -500,15 +516,19 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                 mfi_ok = _mfi_gt_ma10(sub_m, row_m, mfi_m)
                 if ema5_m is not None and ema10_m is not None and ema20_m is not None and mfi_ok:
                     monthly_ok = ema5_m > ema10_m > ema20_m
-                    if monthly_ok and macd_m is not None and macd_m_prev is not None and macd_m_prev2 is not None:
-                        monthly_ok = not (macd_m < macd_m_prev < macd_m_prev2)
+                #    if monthly_ok and macd_m is not None and macd_m_prev is not None and macd_m_prev2 is not None:
+                #        monthly_ok = not (macd_m < macd_m_prev < macd_m_prev2)
+            elif self.allow_missing_periods:
+                monthly_ok = True
 
+            """
             weekly_ok = False
-            sub_w = _get_sub(df_week, inst)
+            sub_w = _get_sub(df_week, inst, period="week")
             if not sub_w.empty:
                 row_w = sub_w.iloc[-1]
                 mfi_w = _get_float(row_w, "$MFI")
                 weekly_ok = _mfi_gt_ma10(sub_w, row_w, mfi_w)
+                """
                 if weekly_ok and "$close" in sub_w.columns and "$MFI" in sub_w.columns:
                     close_recent = pd.to_numeric(sub_w["$close"], errors="coerce").tail(10)
                     mfi_recent = pd.to_numeric(sub_w["$MFI"], errors="coerce").tail(10)
@@ -518,14 +538,18 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                         if not pd.isna(close_w) and not pd.isna(mfi_w_recent):
                             if close_w == close_recent.max() and mfi_w_recent != mfi_recent.max():
                                 weekly_ok = False
-
+            """
+            """
             yearly_ok = False
-            sub_y = _get_sub(df_year, inst)
+            sub_y = _get_sub(df_year, inst, period="year")
             if not sub_y.empty:
                 row_y = sub_y.iloc[-1]
                 mfi_y = _get_float(row_y, "$MFI")
                 yearly_ok = _mfi_gt_ma10(sub_y, row_y, mfi_y)
-
+            elif self.allow_missing_periods:
+                yearly_ok = True
+            """
+            """
             vol_ok = False
             if "$volume" in sub.columns:
                 vol_series = pd.to_numeric(sub["$volume"], errors="coerce").tail(10)
@@ -541,7 +565,7 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                 and macd_prev2 is not None
                 and macd < macd_prev < macd_prev2
             )
-
+            
             daily_peak_ok = True
             if "$close" in sub.columns and "$MFI" in sub.columns:
                 close_series = pd.to_numeric(sub["$close"], errors="coerce").tail(10)
@@ -553,7 +577,41 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                         # if price makes a recent high but MFI does not, disallow
                         if close_last == close_series.max() and mfi_last != mfi_series.max():
                             daily_peak_ok = False
-
+            
+            
+            # Sell signal: daily MFI crosses above its MFI_MA10 (golden cross) -> signal to sell
+            sell_mfi_cross = False
+            try:
+                if "$MFI" in sub.columns:
+                    curr_mfi = _get_float(row, "$MFI")
+                    prev_mfi = _get_float(prev_row, "$MFI")
+                    if curr_mfi is not None and prev_mfi is not None:
+                        # prefer precomputed MA if available
+                        if "$MFI_MA10" in sub.columns:
+                            curr_ma = row.get("$MFI_MA10")
+                            prev_ma = prev_row.get("$MFI_MA10") if prev_row is not None else None
+                            if curr_ma is not None and prev_ma is not None and not pd.isna(curr_ma) and not pd.isna(prev_ma):
+                                try:
+                                    if prev_mfi <= float(prev_ma) and curr_mfi > float(curr_ma):
+                                        sell_mfi_cross = True
+                                except Exception:
+                                    sell_mfi_cross = False
+                        else:
+                            # compute simple rolling MA10 and check last two points
+                            try:
+                                full_mfi = pd.to_numeric(sub["$MFI"], errors="coerce")
+                                ma = full_mfi.rolling(10, min_periods=1).mean()
+                                if len(ma.dropna()) >= 2:
+                                    prev_ma = ma.iloc[-2]
+                                    curr_ma = ma.iloc[-1]
+                                    if not pd.isna(prev_ma) and not pd.isna(curr_ma):
+                                        if prev_mfi <= prev_ma and curr_mfi > curr_ma:
+                                            sell_mfi_cross = True
+                            except Exception:
+                                sell_mfi_cross = False
+            except Exception:
+                sell_mfi_cross = False
+            
             daily_ok = (
                 dif > dea
                 and dif > 0
@@ -562,16 +620,17 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                 and mfi_day_ok
                 and daily_peak_ok
             )
-
+"""
             macd_buy = (
-                daily_ok
-                and monthly_ok
-                and weekly_ok
-                and yearly_ok
+                weekly_ok
+                #and daily_ok
+                #and monthly_ok
+                #and yearly_ok
             )
 
             buy = macd_buy
             sell = []
+            #sell = bool(sell_mfi_cross)
             flags[inst] = {"buy": bool(buy), "sell": bool(sell)}
         return flags
 
