@@ -3,6 +3,7 @@
 import os
 import copy
 import warnings
+import bisect
 import numpy as np
 import pandas as pd
 
@@ -293,6 +294,621 @@ class TopkDropoutStrategy(BaseSignalStrategy):
                 direction=Order.BUY,  # 1 for buy
             )
             buy_order_list.append(buy_order)
+        return TradeDecisionWO(sell_order_list + buy_order_list, self)
+
+
+class MACDTopkDropoutStrategy_v3(TopkDropoutStrategy):
+    """TopkDropoutStrategy with precomputed vectorized MACD buy filter.
+
+    v3 design goals:
+    - Based on TopkDropoutStrategy core logic
+    - Left-side trade filter: DIF > DEA and DIF > 0 (daily)
+    - No qlib data loading inside backtest
+    - No per-instrument loop for MACD condition filtering during backtest
+
+    Parameters
+    ----------
+    indicator_data : pd.DataFrame or pd.Series
+        Precomputed indicator data passed in before backtest.
+        Supported formats:
+        1) MultiIndex(datetime, instrument) DataFrame with indicator columns (e.g. DIF/DEA/MFI)
+        2) MultiIndex(datetime, instrument) bool Series (True means allowed to buy)
+    filter_expr : str
+        Vectorized boolean expression evaluated on indicator_data columns.
+        Default: "(DIF > DEA) & (DIF > 0)"
+        Example: "(MFI > 50) & (DIF > DEA)"
+        allow_no_filter_date : bool
+        If True and no indicator data for a date, skip filter for that date.
+        If False and no indicator data for a date, no buy candidates are allowed.
+
+    Backward compatibility
+    ----------------------
+    macd_data / dif_col / dea_col / allow_no_macd_date are still supported.
+    """
+
+    def __init__(
+        self,
+        *,
+        topk,
+        n_drop,
+        indicator_data: Optional[Union[pd.DataFrame, pd.Series]] = None,
+        filter_expr: Optional[str] = "(DIF > DEA) & (DIF > 0)",
+        allow_no_filter_date: bool = True,
+        macd_data: Optional[Union[pd.DataFrame, pd.Series]] = None,
+        dif_col: str = "DIF",
+        dea_col: str = "DEA",
+        allow_no_macd_date: Optional[bool] = None,
+        log_filter_stats: bool = True,
+        **kwargs,
+    ):
+        super().__init__(topk=topk, n_drop=n_drop, **kwargs)
+        if indicator_data is None and macd_data is not None:
+            indicator_data = macd_data
+        if allow_no_macd_date is not None:
+            allow_no_filter_date = allow_no_macd_date
+
+        self.allow_no_filter_date = allow_no_filter_date
+        self.log_filter_stats = log_filter_stats
+        self._logger = get_module_logger(self.__class__.__name__)
+        self._buy_by_date: Dict[object, pd.Index] = {}
+        self._stat_total_days = 0
+        self._stat_pred_none_days = 0
+        self._stat_filter_missing_date_days = 0
+        self._stat_filter_fallback_prev_days = 0
+        self._stat_filter_empty_days = 0
+        self._stat_no_order_days = 0
+        self._missing_filter_date_examples: List[str] = []
+        self._buy_dates_sorted: List[object] = []
+        self._prepare_precomputed_buy_map(
+            indicator_data=indicator_data,
+            filter_expr=filter_expr,
+            dif_col=dif_col,
+            dea_col=dea_col,
+        )
+
+    @staticmethod
+    def _normalize_datetime_instrument_index(data: Union[pd.DataFrame, pd.Series]) -> Union[pd.DataFrame, pd.Series]:
+        if isinstance(data.index, pd.MultiIndex):
+            names = list(data.index.names)
+            if "datetime" in names and "instrument" in names:
+                data = data.reorder_levels(["datetime", "instrument"]).sort_index()
+            elif len(names) == 2:
+                # Fallback for unnamed / reversed two-level index
+                lvl0, lvl1 = names[0], names[1]
+                if lvl0 == "instrument" and lvl1 == "datetime":
+                    data = data.reorder_levels(["datetime", "instrument"]).sort_index()
+        return data
+
+    def _prepare_precomputed_buy_map(
+        self,
+        *,
+        indicator_data: Optional[Union[pd.DataFrame, pd.Series]],
+        filter_expr: Optional[str],
+        dif_col: str,
+        dea_col: str,
+    ) -> None:
+        if indicator_data is None:
+            return
+
+        buy_mask: Optional[pd.Series] = None
+
+        if isinstance(indicator_data, pd.Series):
+            s = self._normalize_datetime_instrument_index(indicator_data.copy())
+            if isinstance(s.index, pd.MultiIndex) and s.index.nlevels == 2:
+                if s.dtype == bool:
+                    buy_mask = s
+                else:
+                    buy_mask = s.astype(bool)
+        elif isinstance(indicator_data, pd.DataFrame):
+            df = self._normalize_datetime_instrument_index(indicator_data.copy())
+            if isinstance(df.index, pd.MultiIndex) and df.index.nlevels == 2:
+                if filter_expr:
+                    try:
+                        buy_mask = df.eval(filter_expr, engine="python")
+                    except Exception:
+                        buy_mask = None
+                if buy_mask is None:
+                    candidate_pairs = [
+                        (dif_col, dea_col),
+                        ("$DIF", "$DEA"),
+                        ("dif", "dea"),
+                        ("DIF", "DEA"),
+                    ]
+                    selected = None
+                    for d_col, e_col in candidate_pairs:
+                        if d_col in df.columns and e_col in df.columns:
+                            selected = (d_col, e_col)
+                            break
+                    if selected is not None:
+                        d_col, e_col = selected
+                        dif = pd.to_numeric(df[d_col], errors="coerce")
+                        dea = pd.to_numeric(df[e_col], errors="coerce")
+                        buy_mask = (dif > dea) & (dif > 0)
+                    elif "buy" in df.columns:
+                        buy_mask = df["buy"].astype(bool)
+
+        if buy_mask is None or buy_mask.empty:
+            return
+
+        buy_mask = buy_mask.fillna(False).astype(bool)
+        for dt, sub in buy_mask.groupby(level="datetime"):
+            allowed = sub[sub].index.get_level_values("instrument")
+            self._buy_by_date[pd.Timestamp(dt).date()] = pd.Index(allowed)
+        self._buy_dates_sorted = sorted(self._buy_by_date.keys())
+
+    def _apply_precomputed_filter(self, pred_score: pd.Series, pred_end_time) -> Tuple[pd.Series, str]:
+        if pred_score is None or pred_score.empty:
+            return pred_score, "pred_empty"
+        if not self._buy_by_date:
+            return pred_score, "no_filter_map"
+
+        dt_key = pd.Timestamp(pred_end_time).date()
+        allowed = self._buy_by_date.get(dt_key, None)
+        if allowed is None:
+            if self._buy_dates_sorted:
+                pos = bisect.bisect_right(self._buy_dates_sorted, dt_key) - 1
+                if pos >= 0:
+                    prev_key = self._buy_dates_sorted[pos]
+                    prev_allowed = self._buy_by_date.get(prev_key, None)
+                    if prev_allowed is not None:
+                        filtered_prev = pred_score[pred_score.index.isin(prev_allowed)]
+                        if filtered_prev.empty:
+                            return filtered_prev, "fallback_prev_filtered_empty"
+                        return filtered_prev, "fallback_prev_ok"
+            if self.allow_no_filter_date:
+                return pred_score, "missing_filter_date_passthrough"
+            return pred_score.iloc[0:0], "missing_filter_date_blocked"
+
+        filtered = pred_score[pred_score.index.isin(allowed)]
+        if filtered.empty:
+            return filtered, "filtered_empty"
+        return filtered, "ok"
+
+    def _maybe_log_filter_stats(self, trade_step: int) -> None:
+        if not self.log_filter_stats:
+            return
+        try:
+            trade_len = self.trade_calendar.get_trade_len()
+        except Exception:
+            trade_len = None
+        if trade_len is None or trade_step != trade_len - 1:
+            return
+
+        self._logger.info(
+            "v3 filter stats | total_days=%d, pred_none_days=%d, missing_filter_date_days=%d, "
+            "fallback_prev_days=%d, filter_empty_days=%d, no_order_days=%d, buy_map_days=%d, missing_examples=%s",
+            self._stat_total_days,
+            self._stat_pred_none_days,
+            self._stat_filter_missing_date_days,
+            self._stat_filter_fallback_prev_days,
+            self._stat_filter_empty_days,
+            self._stat_no_order_days,
+            len(self._buy_by_date),
+            self._missing_filter_date_examples,
+        )
+
+    def generate_trade_decision(self, execute_result=None):
+        trade_step = self.trade_calendar.get_trade_step()
+        self._stat_total_days += 1
+        trade_start_time, trade_end_time = self.trade_calendar.get_step_time(trade_step)
+        pred_start_time, pred_end_time = self.trade_calendar.get_step_time(trade_step, shift=1)
+        pred_score = self.signal.get_signal(start_time=pred_start_time, end_time=pred_end_time)
+        if isinstance(pred_score, pd.DataFrame):
+            pred_score = pred_score.iloc[:, 0]
+        if pred_score is None:
+            self._stat_pred_none_days += 1
+            self._stat_no_order_days += 1
+            self._maybe_log_filter_stats(trade_step)
+            return TradeDecisionWO([], self)
+
+        pred_score, filter_status = self._apply_precomputed_filter(pred_score, pred_end_time)
+        if filter_status == "missing_filter_date_blocked":
+            self._stat_filter_missing_date_days += 1
+            if len(self._missing_filter_date_examples) < 15:
+                self._missing_filter_date_examples.append(str(pd.Timestamp(pred_end_time).date()))
+        elif filter_status == "fallback_prev_ok":
+            self._stat_filter_fallback_prev_days += 1
+        elif filter_status == "fallback_prev_filtered_empty":
+            self._stat_filter_fallback_prev_days += 1
+            self._stat_filter_empty_days += 1
+        elif filter_status == "filtered_empty":
+            self._stat_filter_empty_days += 1
+
+        if pred_score is None or pred_score.empty:
+            self._stat_no_order_days += 1
+            self._maybe_log_filter_stats(trade_step)
+            return TradeDecisionWO([], self)
+
+        if self.only_tradable:
+            def get_first_n(li, n, reverse=False):
+                cur_n = 0
+                res = []
+                for si in reversed(li) if reverse else li:
+                    if self.trade_exchange.is_stock_tradable(
+                        stock_id=si, start_time=trade_start_time, end_time=trade_end_time
+                    ):
+                        res.append(si)
+                        cur_n += 1
+                        if cur_n >= n:
+                            break
+                return res[::-1] if reverse else res
+
+            def get_last_n(li, n):
+                return get_first_n(li, n, reverse=True)
+
+            def filter_stock(li):
+                return [
+                    si
+                    for si in li
+                    if self.trade_exchange.is_stock_tradable(
+                        stock_id=si, start_time=trade_start_time, end_time=trade_end_time
+                    )
+                ]
+
+        else:
+            def get_first_n(li, n):
+                return list(li)[:n]
+
+            def get_last_n(li, n):
+                return list(li)[-n:]
+
+            def filter_stock(li):
+                return li
+
+        current_temp: Position = copy.deepcopy(self.trade_position)
+        sell_order_list = []
+        buy_order_list = []
+        cash = current_temp.get_cash()
+        current_stock_list = current_temp.get_stock_list()
+
+        last = pred_score.reindex(current_stock_list).sort_values(ascending=False).index
+        if self.method_buy == "top":
+            today = get_first_n(
+                pred_score[~pred_score.index.isin(last)].sort_values(ascending=False).index,
+                self.n_drop + self.topk - len(last),
+            )
+        elif self.method_buy == "random":
+            topk_candi = get_first_n(pred_score.sort_values(ascending=False).index, self.topk)
+            candi = list(filter(lambda x: x not in last, topk_candi))
+            n = self.n_drop + self.topk - len(last)
+            try:
+                today = np.random.choice(candi, n, replace=False)
+            except ValueError:
+                today = candi
+        else:
+            raise NotImplementedError(f"This type of input is not supported")
+
+        comb = pred_score.reindex(last.union(pd.Index(today))).sort_values(ascending=False).index
+        if self.method_sell == "bottom":
+            sell = last[last.isin(get_last_n(comb, self.n_drop))]
+        elif self.method_sell == "random":
+            candi = filter_stock(last)
+            try:
+                sell = pd.Index(np.random.choice(candi, self.n_drop, replace=False) if len(last) else [])
+            except ValueError:
+                sell = candi
+        else:
+            raise NotImplementedError(f"This type of input is not supported")
+
+        buy = today[: len(sell) + self.topk - len(last)]
+        for code in current_stock_list:
+            if not self.trade_exchange.is_stock_tradable(
+                stock_id=code,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
+                direction=None if self.forbid_all_trade_at_limit else OrderDir.SELL,
+            ):
+                continue
+            if code in sell:
+                time_per_step = self.trade_calendar.get_freq()
+                if current_temp.get_stock_count(code, bar=time_per_step) < self.hold_thresh:
+                    continue
+                sell_amount = current_temp.get_stock_amount(code=code)
+                sell_order = Order(
+                    stock_id=code,
+                    amount=sell_amount,
+                    start_time=trade_start_time,
+                    end_time=trade_end_time,
+                    direction=Order.SELL,
+                )
+                if self.trade_exchange.check_order(sell_order):
+                    sell_order_list.append(sell_order)
+                    trade_val, trade_cost, trade_price = self.trade_exchange.deal_order(
+                        sell_order, position=current_temp
+                    )
+                    cash += trade_val - trade_cost
+
+        value = cash * self.risk_degree / len(buy) if len(buy) > 0 else 0
+        for code in buy:
+            if not self.trade_exchange.is_stock_tradable(
+                stock_id=code,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
+                direction=None if self.forbid_all_trade_at_limit else OrderDir.BUY,
+            ):
+                continue
+            buy_price = self.trade_exchange.get_deal_price(
+                stock_id=code, start_time=trade_start_time, end_time=trade_end_time, direction=OrderDir.BUY
+            )
+            buy_amount = value / buy_price
+            factor = self.trade_exchange.get_factor(stock_id=code, start_time=trade_start_time, end_time=trade_end_time)
+            buy_amount = self.trade_exchange.round_amount_by_trade_unit(buy_amount, factor)
+            buy_order = Order(
+                stock_id=code,
+                amount=buy_amount,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
+                direction=Order.BUY,
+            )
+            buy_order_list.append(buy_order)
+        if len(sell_order_list) + len(buy_order_list) == 0:
+            self._stat_no_order_days += 1
+        self._maybe_log_filter_stats(trade_step)
+        return TradeDecisionWO(sell_order_list + buy_order_list, self)
+
+
+class TopkDropoutStrategyHardStopLoss(TopkDropoutStrategy):
+    """TopkDropout strategy with hard stop-loss.
+
+    If current price falls below buy_price * (1 - stop_loss_pct),
+    the position will be fully liquidated regardless of hold_thresh.
+    """
+
+    def __init__(
+        self,
+        *,
+        topk,
+        n_drop,
+        stop_loss_pct: float = 0.30,
+        take_profit_pct: float = 1.0,
+        take_profit_sell_ratio: float = 0.50,
+        trailing_stop_drawdown: float = 0.20,
+        **kwargs,
+    ):
+        super().__init__(topk=topk, n_drop=n_drop, **kwargs)
+        self.stop_loss_pct = stop_loss_pct
+        self.take_profit_pct = take_profit_pct
+        self.take_profit_sell_ratio = take_profit_sell_ratio
+        self.trailing_stop_drawdown = trailing_stop_drawdown
+        self._tp_holdout: Set[str] = set()
+        self._tp_high: Dict[str, float] = {}
+
+    def generate_trade_decision(self, execute_result=None):
+        trade_step = self.trade_calendar.get_trade_step()
+        trade_start_time, trade_end_time = self.trade_calendar.get_step_time(trade_step)
+        pred_start_time, pred_end_time = self.trade_calendar.get_step_time(trade_step, shift=1)
+        pred_score = self.signal.get_signal(start_time=pred_start_time, end_time=pred_end_time)
+        if isinstance(pred_score, pd.DataFrame):
+            pred_score = pred_score.iloc[:, 0]
+        if pred_score is None:
+            return TradeDecisionWO([], self)
+
+        if self.only_tradable:
+            def get_first_n(li, n, reverse=False):
+                cur_n = 0
+                res = []
+                for si in reversed(li) if reverse else li:
+                    if self.trade_exchange.is_stock_tradable(
+                        stock_id=si, start_time=trade_start_time, end_time=trade_end_time
+                    ):
+                        res.append(si)
+                        cur_n += 1
+                        if cur_n >= n:
+                            break
+                return res[::-1] if reverse else res
+
+            def get_last_n(li, n):
+                return get_first_n(li, n, reverse=True)
+
+            def filter_stock(li):
+                return [
+                    si
+                    for si in li
+                    if self.trade_exchange.is_stock_tradable(
+                        stock_id=si, start_time=trade_start_time, end_time=trade_end_time
+                    )
+                ]
+        else:
+            def get_first_n(li, n):
+                return list(li)[:n]
+
+            def get_last_n(li, n):
+                return list(li)[-n:]
+
+            def filter_stock(li):
+                return li
+
+        current_temp: Position = copy.deepcopy(self.trade_position)
+        sell_order_list = []
+        buy_order_list = []
+        cash = current_temp.get_cash()
+        current_stock_list = current_temp.get_stock_list()
+
+        forced_sell_amounts: Dict[str, float] = {}
+        tp_holdout_add: Set[str] = set()
+        tp_holdout_remove: Set[str] = set()
+        for code in current_stock_list:
+            try:
+                buy_price = current_temp.position.get(code, {}).get("buy_price", None)
+            except Exception:
+                buy_price = None
+            try:
+                cur_price = self.trade_exchange.get_deal_price(
+                    stock_id=code,
+                    start_time=trade_start_time,
+                    end_time=trade_end_time,
+                    direction=OrderDir.SELL,
+                )
+            except Exception:
+                cur_price = None
+            if cur_price is None:
+                continue
+
+            if code in self._tp_holdout:
+                prev_high = self._tp_high.get(code, cur_price)
+                self._tp_high[code] = max(prev_high, cur_price)
+                if self._tp_high[code] > 0 and cur_price <= self._tp_high[code] * (1 - self.trailing_stop_drawdown):
+                    try:
+                        amt = current_temp.get_stock_amount(code=code)
+                    except Exception:
+                        amt = 0
+                    if amt and amt > 0:
+                        forced_sell_amounts[code] = amt
+                        tp_holdout_remove.add(code)
+                continue
+
+            if (
+                self.take_profit_pct is not None
+                and buy_price is not None
+                and buy_price > 0
+                and cur_price >= buy_price * (1 + self.take_profit_pct)
+            ):
+                try:
+                    amt = current_temp.get_stock_amount(code=code)
+                except Exception:
+                    amt = 0
+                if amt and amt > 0:
+                    sell_amt = amt * self.take_profit_sell_ratio
+                    factor = self.trade_exchange.get_factor(
+                        stock_id=code, start_time=trade_start_time, end_time=trade_end_time
+                    )
+                    sell_amt = self.trade_exchange.round_amount_by_trade_unit(sell_amt, factor)
+                    if sell_amt and sell_amt > 0:
+                        forced_sell_amounts[code] = sell_amt
+                        tp_holdout_add.add(code)
+                        self._tp_high[code] = cur_price
+
+        holdout_set = set(self._tp_holdout) | tp_holdout_add
+        current_stock_list_active = [c for c in current_stock_list if c not in holdout_set]
+        last = pred_score.reindex(current_stock_list_active).sort_values(ascending=False).index
+
+        stop_loss_set: Set[str] = set()
+        if self.stop_loss_pct is not None:
+            for code in current_stock_list:
+                try:
+                    buy_price = current_temp.position.get(code, {}).get("buy_price", None)
+                except Exception:
+                    buy_price = None
+                if buy_price is None or buy_price <= 0:
+                    continue
+                try:
+                    cur_price = self.trade_exchange.get_deal_price(
+                        stock_id=code,
+                        start_time=trade_start_time,
+                        end_time=trade_end_time,
+                        direction=OrderDir.SELL,
+                    )
+                except Exception:
+                    cur_price = None
+                if cur_price is None:
+                    continue
+                if cur_price <= buy_price * (1 - self.stop_loss_pct):
+                    stop_loss_set.add(code)
+
+        if self.method_buy == "top":
+            excluded = pd.Index(last).union(pd.Index(list(holdout_set)))
+            today = get_first_n(
+                pred_score[~pred_score.index.isin(excluded)].sort_values(ascending=False).index,
+                self.n_drop + self.topk - len(last),
+            )
+        elif self.method_buy == "random":
+            topk_candi = get_first_n(pred_score.sort_values(ascending=False).index, self.topk)
+            candi = list(filter(lambda x: (x not in last) and (x not in holdout_set), topk_candi))
+            n = self.n_drop + self.topk - len(last)
+            try:
+                today = np.random.choice(candi, n, replace=False)
+            except ValueError:
+                today = candi
+        else:
+            raise NotImplementedError("This type of input is not supported")
+
+        comb = pred_score.reindex(last.union(pd.Index(today))).sort_values(ascending=False).index
+        if self.method_sell == "bottom":
+            sell = last[last.isin(get_last_n(comb, self.n_drop))]
+        elif self.method_sell == "random":
+            candi = filter_stock(last)
+            try:
+                sell = pd.Index(np.random.choice(candi, self.n_drop, replace=False) if len(last) else [])
+            except ValueError:
+                sell = candi
+        else:
+            raise NotImplementedError("This type of input is not supported")
+
+        mandatory_sell = set(stop_loss_set) | set(forced_sell_amounts.keys())
+        if mandatory_sell:
+            sell = sell.union(pd.Index(list(mandatory_sell)))
+
+        full_liq_set = set(stop_loss_set) | set(tp_holdout_remove)
+        holdout_remaining_count = len([c for c in holdout_set if c in current_stock_list and c not in full_liq_set])
+        target_non_hold = max(self.topk - holdout_remaining_count, 0)
+        sell_from_last = len([c for c in sell if c in set(last)])
+        buy_capacity = max(0, sell_from_last + target_non_hold - len(last))
+        buy = today[:buy_capacity]
+
+        for code in current_stock_list:
+            if not self.trade_exchange.is_stock_tradable(
+                stock_id=code,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
+                direction=None if self.forbid_all_trade_at_limit else OrderDir.SELL,
+            ):
+                continue
+            if code in sell:
+                time_per_step = self.trade_calendar.get_freq()
+                if (
+                    code not in stop_loss_set
+                    and code not in forced_sell_amounts
+                    and current_temp.get_stock_count(code, bar=time_per_step) < self.hold_thresh
+                ):
+                    continue
+                if code in forced_sell_amounts:
+                    sell_amount = forced_sell_amounts[code]
+                else:
+                    sell_amount = current_temp.get_stock_amount(code=code)
+                sell_order = Order(
+                    stock_id=code,
+                    amount=sell_amount,
+                    start_time=trade_start_time,
+                    end_time=trade_end_time,
+                    direction=Order.SELL,
+                )
+                if self.trade_exchange.check_order(sell_order):
+                    sell_order_list.append(sell_order)
+                    trade_val, trade_cost, trade_price = self.trade_exchange.deal_order(sell_order, position=current_temp)
+                    cash += trade_val - trade_cost
+
+        value = cash * self.risk_degree / len(buy) if len(buy) > 0 else 0
+        for code in buy:
+            if not self.trade_exchange.is_stock_tradable(
+                stock_id=code,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
+                direction=None if self.forbid_all_trade_at_limit else OrderDir.BUY,
+            ):
+                continue
+            buy_price = self.trade_exchange.get_deal_price(
+                stock_id=code, start_time=trade_start_time, end_time=trade_end_time, direction=OrderDir.BUY
+            )
+            buy_amount = value / buy_price
+            factor = self.trade_exchange.get_factor(stock_id=code, start_time=trade_start_time, end_time=trade_end_time)
+            buy_amount = self.trade_exchange.round_amount_by_trade_unit(buy_amount, factor)
+            buy_order = Order(
+                stock_id=code,
+                amount=buy_amount,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
+                direction=Order.BUY,
+            )
+            buy_order_list.append(buy_order)
+
+        if tp_holdout_add:
+            self._tp_holdout.update(tp_holdout_add)
+        remove_holdout = set(tp_holdout_remove) | set(stop_loss_set)
+        if remove_holdout:
+            for c in remove_holdout:
+                self._tp_holdout.discard(c)
+                self._tp_high.pop(c, None)
+
         return TradeDecisionWO(sell_order_list + buy_order_list, self)
 
 class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
@@ -746,7 +1362,7 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
             bullish = {k for k in bullish if bool(turnover_mask.get(k, self.allow_missing_shares))}
 
         stop_loss_set: Set[str] = set()
-        month_df = self._cached_month_df if hasattr(self, "_cached_month_df") else self._normalize_indicator_df(self._get_indicator_df("month"))
+        #month_df = self._cached_month_df if hasattr(self, "_cached_month_df") else self._normalize_indicator_df(self._get_indicator_df("month"))
         if self.stop_loss_pct is not None:
             for code in current_stock_list_all:
                 try:
@@ -766,6 +1382,7 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                     cur_price = None
                 if cur_price is None:
                     continue
+                """
                 monthly_break = True
                 if month_df is not None and not month_df.empty:
                     try:
@@ -781,6 +1398,8 @@ class MACDTopkDropoutStrategy_v2(TopkDropoutStrategy):
                     except Exception:
                         monthly_break = True
                 if cur_price <= buy_price * (1 - self.stop_loss_pct) and monthly_break:
+                """
+                if cur_price <= buy_price * (1 - self.stop_loss_pct):
                     stop_loss_set.add(code)
 
         if not bullish and not stop_loss_set and not forced_sell_amounts:

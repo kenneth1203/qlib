@@ -268,12 +268,16 @@ if __name__ == "__main__":
             },
         },
         "strategy": {
-            "class": "TopkDropoutStrategy",
+            "class": "TopkDropoutStrategyHardStopLoss",
             "module_path": "qlib.contrib.strategy.signal_strategy",
             "kwargs": {
                 "signal": (model, dataset),
                 "topk": 6,
                 "n_drop": 1,
+                #"hold_thresh": 3,
+                #"risk_degree": 0.8,
+                "stop_loss_pct": 0.30,
+                "take_profit_pct": None,
                 "only_tradable": True,
                 "forbid_all_trade_at_limit": True
             },
@@ -312,6 +316,7 @@ if __name__ == "__main__":
 
     example_df = dataset.prepare("train")
     print(example_df.head())
+    """
     # 只印出第一支股票的前 5 天，並完整列出所有因子
     try:
         insts = example_df.index.get_level_values("instrument").unique()
@@ -329,7 +334,7 @@ if __name__ == "__main__":
         # 回退到原本的簡單輸出，避免因 inspect 失敗中斷流程
         print("Failed to slice by instrument, falling back to head():", _e)
         print(example_df.head())
-
+    """
     # start exp
     with R.start(experiment_name="workflow"):
         import copy

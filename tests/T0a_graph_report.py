@@ -368,7 +368,7 @@ if __name__ == "__main__":
                     trade_detail_map = {}
                     for inst in res_df["instrument"].astype(str).tolist():
                         sub = trade_df[trade_df["instrument"].astype(str) == inst].copy()
-                        sub = sub.sort_values("buy_time")
+                        sub = sub.sort_values(["buy_time", "sell_time"], ascending=[True, True])
                         rows = []
                         for _, r in sub.iterrows():
                             rows.append(
